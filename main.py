@@ -36,6 +36,17 @@ SERPAPI_KEY = os.getenv("SEARCHAPI_KEY", "").strip()
 # LLM keys (choose one)
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+# Gemini model helper (Render may require full "models/..." names)
+DEFAULT_GEMINI_CHAT_MODEL = os.getenv("GEMINI_CHAT_MODEL", "").strip() or "models/gemini-1.5-flash-002"
+
+def normalize_gemini_model(name: str) -> str:
+    name = (name or "").strip()
+    if not name:
+        name = DEFAULT_GEMINI_CHAT_MODEL
+    # The google-generativeai SDK typically expects names like "models/gemini-1.5-flash-002"
+    if not name.startswith("models/"):
+        name = "models/" + name
+    return name
 
 # CORS
 ALLOWED_ORIGINS = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "").split(",") if o.strip()]
@@ -239,7 +250,8 @@ async def generate_answer(system: str, user: str) -> str:
     if GEMINI_API_KEY:
         import google.generativeai as genai
         genai.configure(api_key=GEMINI_API_KEY)
-        model = genai.GenerativeModel(os.getenv("GEMINI_CHAT_MODEL", "gemini-1.5-flash"))
+        model_name = normalize_gemini_model(os.getenv("GEMINI_CHAT_MODEL", ""))
+        model = genai.GenerativeModel(model_name)
         resp = model.generate_content(
             [system, user],
             generation_config={"temperature": 0.2}
@@ -667,4 +679,3 @@ async def admin_reindex():
 def admin_reindex_status():
     running = bool(index_task and not index_task.done())
     return {"running": running, "chunks": chunks_count()}
-
