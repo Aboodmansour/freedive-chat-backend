@@ -1,8 +1,10 @@
 from pathlib import Path
 from dotenv import load_dotenv
+import os
 
-# Always load .env located next to this file (reliable on Windows/Render)
-load_dotenv(dotenv_path=Path(__file__).with_name(".env"))
+env_path = Path(__file__).with_name(".env")
+if env_path.exists():
+    load_dotenv(env_path)
 
 import os
 import time
@@ -451,6 +453,14 @@ def make_approval_links(base_url: str, booking_id: int) -> Tuple[str, str]:
 # =========================
 app = FastAPI(title="Freediving Site Chat Backend")
 
+@app.get("/")
+def root():
+    return {"status": "ok", "service": "freedive-chat-backend"}
+
+@app.get("/health")
+def health():
+    return {"ok": True}
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
@@ -657,3 +667,4 @@ async def admin_reindex():
 def admin_reindex_status():
     running = bool(index_task and not index_task.done())
     return {"running": running, "chunks": chunks_count()}
+
