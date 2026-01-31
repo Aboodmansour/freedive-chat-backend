@@ -30,28 +30,13 @@ from itsdangerous import URLSafeSerializer, BadSignature
 OWNER_NOTIFY_EMAIL = os.getenv("OWNER_NOTIFY_EMAIL", "").strip()
 SENDGRID_API_KEY = os.getenv("SENDGRID_API_KEY", "").strip()
 
-# Web search (SerpAPI) - you named it SEARCHAPI_KEY in Render
+# SerpAPI key (you named it SEARCHAPI_KEY in Render)
 SERPAPI_KEY = os.getenv("SEARCHAPI_KEY", "").strip()
 
-# LLM keys (choose one)
+# OpenAI
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
-
-def normalize_gemini_model(name: str, default: str) -> str:
-    name = (name or "").strip() or default
-    if not name.startswith("models/"):
-        name = "models/" + name
-    return name
-
-GEMINI_CHAT_MODEL = normalize_gemini_model(
-    os.getenv("GEMINI_CHAT_MODEL", ""),
-    "models/gemini-1.5-flash-002"
-)
-
-GEMINI_EMBED_MODEL = normalize_gemini_model(
-    os.getenv("GEMINI_EMBED_MODEL", ""),
-    "models/text-embedding-004"
-)
+OPENAI_CHAT_MODEL = os.getenv("OPENAI_CHAT_MODEL", "gpt-4o-mini").strip()
+OPENAI_EMBED_MODEL = os.getenv("OPENAI_EMBED_MODEL", "text-embedding-3-small").strip()
 
 # CORS
 ALLOWED_ORIGINS = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "").split(",") if o.strip()]
@@ -76,6 +61,16 @@ MIN_CONFIDENCE = float(os.getenv("MIN_CONFIDENCE", "0.20"))
 
 
 # =========================
+# OpenAI client (async)
+# =========================
+openai_client = None
+if OPENAI_API_KEY:
+    from openai import AsyncOpenAI
+
+    openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
+
+
+# =========================
 # Database
 # =========================
 def db() -> sqlite3.Connection:
@@ -83,10 +78,12 @@ def db() -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     return conn
 
+
 def init_db():
     conn = db()
     cur = conn.cursor()
-    cur.execute("""
+    cur.execute(
+        """
       CREATE TABLE IF NOT EXISTS chunks (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         url TEXT NOT NULL,
@@ -94,33 +91,41 @@ def init_db():
         text TEXT NOT NULL,
         embedding TEXT NOT NULL
       )
-    """)
-    cur.execute("""
+    """
+    )
+    cur.execute(
+        """
       CREATE TABLE IF NOT EXISTS sessions (
         session_id TEXT PRIMARY KEY,
         created_at INTEGER NOT NULL
       )
-    """)
-    cur.execute("""
+    """
+    )
+    cur.execute(
+        """
       CREATE TABLE IF NOT EXISTS human_messages (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         session_id TEXT NOT NULL,
         text TEXT NOT NULL,
         ts INTEGER NOT NULL
       )
-    """)
-    cur.execute("""
+    """
+    )
+    cur.execute(
+        """
       CREATE TABLE IF NOT EXISTS booking_requests (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         session_id TEXT NOT NULL,
-        status TEXT NOT NULL,
+        status TEXT NOT NULL, -- pending|approved|denied
         details_json TEXT NOT NULL,
         created_at INTEGER NOT NULL,
         updated_at INTEGER NOT NULL
       )
-    """)
+    """
+    )
     conn.commit()
     conn.close()
+
 
 def chunks_count() -> int:
     conn = db()
@@ -137,6 +142,7 @@ def chunks_count() -> int:
 def now_ts() -> int:
     return int(time.time())
 
+
 def cosine(a: List[float], b: List[float]) -> float:
     if not a or not b or len(a) != len(b):
         return 0.0
@@ -149,6 +155,7 @@ def cosine(a: List[float], b: List[float]) -> float:
         nb += y * y
     denom = math.sqrt(na) * math.sqrt(nb)
     return (dot / denom) if denom else 0.0
+
 
 def strip_text(html: str) -> Tuple[str, str]:
     soup = BeautifulSoup(html, "html.parser")
@@ -165,6 +172,7 @@ def strip_text(html: str) -> Tuple[str, str]:
     cleaned = "\n".join(lines)
     return title, cleaned
 
+
 def chunk_text(text: str, chunk_chars: int, overlap: int) -> List[str]:
     if len(text) <= chunk_chars:
         return [text]
@@ -178,19 +186,32 @@ def chunk_text(text: str, chunk_chars: int, overlap: int) -> List[str]:
             break
     return chunks
 
+
 def looks_like_booking(q: str) -> bool:
     ql = q.lower()
     triggers = [
-        "book", "booking", "reserve", "reservation", "schedule",
-        "join course", "course booking", "lesson", "class",
-        "training", "session", "availability", "price for course"
+        "book",
+        "booking",
+        "reserve",
+        "reservation",
+        "schedule",
+        "join course",
+        "course booking",
+        "lesson",
+        "class",
+        "training",
+        "session",
+        "availability",
+        "price for course",
     ]
     return any(t in ql for t in triggers)
+
 
 def wants_human(q: str) -> bool:
     ql = q.lower()
     triggers = ["human", "real person", "instructor", "call me", "contact you", "talk to you", "agent"]
     return any(t in ql for t in triggers)
+
 
 def is_medical_or_high_risk(q: str) -> bool:
     ql = q.lower()
@@ -199,63 +220,33 @@ def is_medical_or_high_risk(q: str) -> bool:
 
 
 # =========================
-# LLM (OpenAI or Gemini)
+# OpenAI helpers
 # =========================
+def _require_openai():
+    if not openai_client:
+        raise HTTPException(status_code=500, detail="OPENAI_API_KEY not set")
+
+
 async def embed_text(text: str) -> List[float]:
-    if OPENAI_API_KEY:
-        import openai
-        client = openai.OpenAI(api_key=OPENAI_API_KEY)
-        resp = client.embeddings.create(
-            model=os.getenv("OPENAI_EMBED_MODEL", "text-embedding-3-small"),
-            input=text[:6000]
-        )
-        return list(resp.data[0].embedding)
+    _require_openai()
+    resp = await openai_client.embeddings.create(
+        model=OPENAI_EMBED_MODEL,
+        input=text[:6000],
+    )
+    return list(resp.data[0].embedding)
 
-    if GEMINI_API_KEY:
-        import google.generativeai as genai
-        genai.configure(api_key=GEMINI_API_KEY)
-
-        res = genai.embed_content(
-            model=GEMINI_EMBED_MODEL,
-            content=text[:6000],
-            task_type="retrieval_query",
-        )
-
-        emb = res.get("embedding") if isinstance(res, dict) else getattr(res, "embedding", None)
-        if not emb:
-            raise HTTPException(status_code=500, detail="Gemini embedding response missing 'embedding'")
-        return list(emb)
-
-    raise HTTPException(status_code=500, detail="No embedding key set. Set OPENAI_API_KEY or GEMINI_API_KEY.")
 
 async def generate_answer(system: str, user: str) -> str:
-    if OPENAI_API_KEY:
-        import openai
-        client = openai.OpenAI(api_key=OPENAI_API_KEY)
-        resp = client.chat.completions.create(
-            model=os.getenv("OPENAI_CHAT_MODEL", "gpt-4o-mini"),
-            messages=[
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
-            temperature=0.2
-        )
-        return resp.choices[0].message.content.strip()
-
-    if GEMINI_API_KEY:
-        import google.generativeai as genai
-        genai.configure(api_key=GEMINI_API_KEY)
-
-        model = genai.GenerativeModel(GEMINI_CHAT_MODEL)
-
-        # Important: pass BOTH system + user text so your rules are applied
-        resp = model.generate_content(
-            [system, user],
-            generation_config={"temperature": 0.2}
-        )
-        return (resp.text or "").strip()
-
-    raise HTTPException(status_code=500, detail="No chat key set. Set OPENAI_API_KEY or GEMINI_API_KEY.")
+    _require_openai()
+    resp = await openai_client.chat.completions.create(
+        model=OPENAI_CHAT_MODEL,
+        messages=[
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+        temperature=0.2,
+    )
+    return (resp.choices[0].message.content or "").strip()
 
 
 # =========================
@@ -271,11 +262,13 @@ def serpapi_search(query: str) -> List[Dict[str, str]]:
     data = r.json()
     results = []
     for item in data.get("organic_results", [])[:5]:
-        results.append({
-            "title": item.get("title", ""),
-            "link": item.get("link", ""),
-            "snippet": item.get("snippet", "")
-        })
+        results.append(
+            {
+                "title": item.get("title", ""),
+                "link": item.get("link", ""),
+                "snippet": item.get("snippet", ""),
+            }
+        )
     return results
 
 
@@ -302,7 +295,7 @@ def send_email(to_email: str, subject: str, html: str):
 
 
 # =========================
-# Site indexing
+# Site indexing (sitemap -> pages -> chunks -> embeddings)
 # =========================
 def parse_sitemap_urls(xml_text: str, site_base_url: str) -> List[str]:
     soup = BeautifulSoup(xml_text, "xml")
@@ -319,6 +312,7 @@ def parse_sitemap_urls(xml_text: str, site_base_url: str) -> List[str]:
         if len(urls) >= MAX_URLS:
             break
     return urls
+
 
 async def build_index():
     site_sitemap_url = os.getenv("SITE_SITEMAP_URL", "").strip()
@@ -354,7 +348,7 @@ async def build_index():
                 emb = await embed_text(ch)
                 cur.execute(
                     "INSERT INTO chunks(url,title,text,embedding) VALUES(?,?,?,?)",
-                    (url, title, ch, json.dumps(emb))
+                    (url, title, ch, json.dumps(emb)),
                 )
             conn.commit()
         except Exception as e:
@@ -365,6 +359,7 @@ async def build_index():
 
     conn.close()
     print("Index build complete.")
+
 
 async def retrieve_site_context(question: str) -> Tuple[List[Dict[str, Any]], float]:
     q_emb = await embed_text(question)
@@ -399,12 +394,14 @@ def ensure_session(session_id: str):
     conn.commit()
     conn.close()
 
+
 def add_human_message(session_id: str, text: str):
     conn = db()
     cur = conn.cursor()
     cur.execute("INSERT INTO human_messages(session_id, text, ts) VALUES(?,?,?)", (session_id, text, now_ts()))
     conn.commit()
     conn.close()
+
 
 def get_human_messages(session_id: str) -> List[Dict[str, Any]]:
     conn = db()
@@ -424,12 +421,13 @@ def create_booking_request(session_id: str, details: Dict[str, Any]) -> int:
     ts = now_ts()
     cur.execute(
         "INSERT INTO booking_requests(session_id,status,details_json,created_at,updated_at) VALUES(?,?,?,?,?)",
-        (session_id, "pending", json.dumps(details), ts, ts)
+        (session_id, "pending", json.dumps(details), ts, ts),
     )
     conn.commit()
     booking_id = cur.lastrowid
     conn.close()
     return booking_id
+
 
 def update_booking_status(booking_id: int, status: str):
     conn = db()
@@ -437,6 +435,7 @@ def update_booking_status(booking_id: int, status: str):
     cur.execute("UPDATE booking_requests SET status=?, updated_at=? WHERE id=?", (status, now_ts(), booking_id))
     conn.commit()
     conn.close()
+
 
 def get_booking(booking_id: int) -> Dict[str, Any]:
     conn = db()
@@ -447,6 +446,7 @@ def get_booking(booking_id: int) -> Dict[str, Any]:
     if not row:
         raise HTTPException(status_code=404, detail="Booking not found")
     return dict(row)
+
 
 def make_approval_links(base_url: str, booking_id: int) -> Tuple[str, str]:
     token = serializer.dumps({"booking_id": booking_id})
@@ -460,13 +460,16 @@ def make_approval_links(base_url: str, booking_id: int) -> Tuple[str, str]:
 # =========================
 app = FastAPI(title="Freediving Site Chat Backend")
 
+
 @app.get("/")
 def root():
     return {"status": "ok", "service": "freedive-chat-backend"}
 
+
 @app.get("/health")
 def health():
     return {"ok": True}
+
 
 app.add_middleware(
     CORSMiddleware,
@@ -476,11 +479,13 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
 class ChatRequest(BaseModel):
     question: str
     session_id: str
     history: Optional[List[Dict[str, Any]]] = None
     page_url: Optional[str] = None
+
 
 class ChatResponse(BaseModel):
     answer: str
@@ -488,12 +493,15 @@ class ChatResponse(BaseModel):
     booking_pending: bool = False
     sources: Optional[List[Dict[str, str]]] = None
 
+
 index_task = None
+
 
 @app.on_event("startup")
 async def on_startup():
     global index_task
     init_db()
+    # build index only if empty
     if chunks_count() == 0:
         index_task = asyncio.create_task(build_index())
 
@@ -512,7 +520,7 @@ async def chat(req: ChatRequest):
                 send_email(
                     OWNER_NOTIFY_EMAIL,
                     "Human takeover requested (Freediving chat)",
-                    f"<p>Session: <b>{req.session_id}</b></p><p>Page: {req.page_url or ''}</p><p>Question: {q}</p>"
+                    f"<p>Session: <b>{req.session_id}</b></p><p>Page: {req.page_url or ''}</p><p>Question: {q}</p>",
                 )
             except Exception:
                 pass
@@ -521,7 +529,7 @@ async def chat(req: ChatRequest):
             answer="I’ve notified the instructor for direct help. Please share your name and contact details if you want a reply by email or WhatsApp.",
             needs_human=True,
             booking_pending=False,
-            sources=[]
+            sources=[],
         )
 
     if looks_like_booking(q):
@@ -557,7 +565,7 @@ async def chat(req: ChatRequest):
             ),
             needs_human=True,
             booking_pending=True,
-            sources=[]
+            sources=[],
         )
 
     chunks, conf = await retrieve_site_context(q)
@@ -621,7 +629,7 @@ def approve_booking(token: str = Query(...)):
 
     add_human_message(
         booking["session_id"],
-        "Instructor: Your booking is confirmed. Please reply with your full name and preferred contact number to finalize details."
+        "Instructor: Your booking is confirmed. Please reply with your full name and preferred contact number to finalize details.",
     )
     return {"ok": True, "status": "approved", "booking_id": booking_id}
 
@@ -639,7 +647,7 @@ def deny_booking(token: str = Query(...)):
 
     add_human_message(
         booking["session_id"],
-        "Instructor: I can’t confirm that booking request yet. Please share alternative dates/times and your experience level."
+        "Instructor: I can’t confirm that booking request yet. Please share alternative dates/times and your experience level.",
     )
     return {"ok": True, "status": "denied", "booking_id": booking_id}
 
