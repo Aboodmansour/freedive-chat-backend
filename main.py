@@ -2,11 +2,11 @@ from pathlib import Path
 from dotenv import load_dotenv
 import os
 
+# Load local .env only if it exists (Render uses environment variables, not .env files)
 env_path = Path(__file__).with_name(".env")
 if env_path.exists():
     load_dotenv(env_path)
 
-import os
 import time
 import json
 import math
@@ -25,28 +25,33 @@ from itsdangerous import URLSafeSerializer, BadSignature
 
 
 # =========================
-# Config (static / safe)
+# Config
 # =========================
 OWNER_NOTIFY_EMAIL = os.getenv("OWNER_NOTIFY_EMAIL", "").strip()
 SENDGRID_API_KEY = os.getenv("SENDGRID_API_KEY", "").strip()
 
-# Web search (SerpAPI)
+# Web search (SerpAPI) - you named it SEARCHAPI_KEY in Render
 SERPAPI_KEY = os.getenv("SEARCHAPI_KEY", "").strip()
 
 # LLM keys (choose one)
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
-# Gemini model helper (Render may require full "models/..." names)
-DEFAULT_GEMINI_CHAT_MODEL = os.getenv("GEMINI_CHAT_MODEL", "").strip() or "models/gemini-1.5-flash-002"
 
-def normalize_gemini_model(name: str) -> str:
-    name = (name or "").strip()
-    if not name:
-        name = DEFAULT_GEMINI_CHAT_MODEL
-    # The google-generativeai SDK typically expects names like "models/gemini-1.5-flash-002"
+def normalize_gemini_model(name: str, default: str) -> str:
+    name = (name or "").strip() or default
     if not name.startswith("models/"):
         name = "models/" + name
     return name
+
+GEMINI_CHAT_MODEL = normalize_gemini_model(
+    os.getenv("GEMINI_CHAT_MODEL", ""),
+    "models/gemini-1.5-flash-002"
+)
+
+GEMINI_EMBED_MODEL = normalize_gemini_model(
+    os.getenv("GEMINI_EMBED_MODEL", ""),
+    "models/text-embedding-004"
+)
 
 # CORS
 ALLOWED_ORIGINS = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "").split(",") if o.strip()]
@@ -108,7 +113,7 @@ def init_db():
       CREATE TABLE IF NOT EXISTS booking_requests (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         session_id TEXT NOT NULL,
-        status TEXT NOT NULL, -- pending|approved|denied
+        status TEXT NOT NULL,
         details_json TEXT NOT NULL,
         created_at INTEGER NOT NULL,
         updated_at INTEGER NOT NULL
@@ -210,26 +215,16 @@ async def embed_text(text: str) -> List[float]:
         import google.generativeai as genai
         genai.configure(api_key=GEMINI_API_KEY)
 
-        # MUST start with "models/"
-        model = os.getenv("GEMINI_EMBED_MODEL", "models/text-embedding-004")
-
         res = genai.embed_content(
-    model=model,
-    content=text[:6000],
-    task_type="retrieval_query"
-)
+            model=GEMINI_EMBED_MODEL,
+            content=text[:6000],
+            task_type="retrieval_query",
+        )
 
-# Support both dict and object return shapes
-        if isinstance(res, dict):
-         emb = res.get("embedding")
-        else:
-         emb = getattr(res, "embedding", None)
-
+        emb = res.get("embedding") if isinstance(res, dict) else getattr(res, "embedding", None)
         if not emb:
-         raise HTTPException(status_code=500, detail="Gemini embedding response missing 'embedding'")
-
+            raise HTTPException(status_code=500, detail="Gemini embedding response missing 'embedding'")
         return list(emb)
-
 
     raise HTTPException(status_code=500, detail="No embedding key set. Set OPENAI_API_KEY or GEMINI_API_KEY.")
 
@@ -250,13 +245,15 @@ async def generate_answer(system: str, user: str) -> str:
     if GEMINI_API_KEY:
         import google.generativeai as genai
         genai.configure(api_key=GEMINI_API_KEY)
-        model_name = normalize_gemini_model(os.getenv("GEMINI_CHAT_MODEL", ""))
-        model = genai.GenerativeModel(model_name)
+
+        model = genai.GenerativeModel(GEMINI_CHAT_MODEL)
+
+        # Important: pass BOTH system + user text so your rules are applied
         resp = model.generate_content(
             [system, user],
             generation_config={"temperature": 0.2}
         )
-        return resp.text.strip()
+        return (resp.text or "").strip()
 
     raise HTTPException(status_code=500, detail="No chat key set. Set OPENAI_API_KEY or GEMINI_API_KEY.")
 
@@ -305,7 +302,7 @@ def send_email(to_email: str, subject: str, html: str):
 
 
 # =========================
-# Site indexing (sitemap -> pages -> chunks -> embeddings)
+# Site indexing
 # =========================
 def parse_sitemap_urls(xml_text: str, site_base_url: str) -> List[str]:
     soup = BeautifulSoup(xml_text, "xml")
@@ -363,7 +360,7 @@ async def build_index():
         except Exception as e:
             print("Index error:", url, str(e))
 
-        if idx % 10 == 0:
+        if (idx + 1) % 10 == 0:
             print(f"Indexed {idx+1}/{len(urls)} pages")
 
     conn.close()
@@ -388,9 +385,7 @@ async def retrieve_site_context(question: str) -> Tuple[List[Dict[str, Any]], fl
     top = scored[:TOP_K]
     confidence = top[0][0] if top else 0.0
 
-    chunks = []
-    for score, url, title, text in top:
-        chunks.append({"score": score, "url": url, "title": title or "", "text": text})
+    chunks = [{"score": s, "url": u, "title": (t or ""), "text": tx} for (s, u, t, tx) in top]
     return chunks, confidence
 
 
@@ -493,16 +488,12 @@ class ChatResponse(BaseModel):
     booking_pending: bool = False
     sources: Optional[List[Dict[str, str]]] = None
 
-
-index_task = None  # global
-
+index_task = None
 
 @app.on_event("startup")
 async def on_startup():
     global index_task
     init_db()
-
-    # Start immediately, index only if empty
     if chunks_count() == 0:
         index_task = asyncio.create_task(build_index())
 
