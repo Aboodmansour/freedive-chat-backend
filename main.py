@@ -1,4 +1,6 @@
 # main.py
+from __future__ import annotations
+
 from pathlib import Path
 from dotenv import load_dotenv
 import os
@@ -12,7 +14,7 @@ import re
 from typing import List, Dict, Any, Optional, Tuple
 
 import requests
-from fastapi import FastAPI, Query, HTTPException
+from fastapi import FastAPI, Query, HTTPException, Request, Form
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -41,21 +43,28 @@ OPENAI_EMBED_MODEL = os.getenv("OPENAI_EMBED_MODEL", "text-embedding-3-small").s
 
 ALLOWED_ORIGINS = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "").split(",") if o.strip()]
 if not ALLOWED_ORIGINS:
-    # safest for production is explicit origins, but keep your current behavior
     ALLOWED_ORIGINS = ["*"]
 
 ADMIN_TOKEN_SECRET = os.getenv("ADMIN_TOKEN_SECRET", "").strip() or ("CHANGE_ME_" + secrets.token_urlsafe(16))
 serializer = URLSafeSerializer(ADMIN_TOKEN_SECRET, salt="booking-approval")
 
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").strip()  # e.g. https://freedive-chat-backend.onrender.com
-DB_PATH = os.getenv("DB_PATH", "data.sqlite3")
 
+# Your website forms (change these to your real URLs)
+FORM_EN_URL = os.getenv("FORM_EN_URL", "").strip() or "https://YOURDOMAIN.COM/form1.php"
+FORM_AR_URL = os.getenv("FORM_AR_URL", "").strip() or "https://YOURDOMAIN.COM/form1ar.php"
+FORM_DE_URL = os.getenv("FORM_DE_URL", "").strip() or "https://YOURDOMAIN.COM/form1de.php"
+
+DB_PATH = os.getenv("DB_PATH", "data.sqlite3")
 MAX_URLS = int(os.getenv("MAX_URLS", "150"))
 MAX_CHUNKS = int(os.getenv("MAX_CHUNKS", "800"))
 CHUNK_CHARS = int(os.getenv("CHUNK_CHARS", "1200"))
 CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "200"))
 TOP_K = int(os.getenv("TOP_K", "6"))
 MIN_CONFIDENCE = float(os.getenv("MIN_CONFIDENCE", "0.20"))
+
+# Admin dashboard protection (simple)
+ADMIN_DASH_TOKEN = os.getenv("ADMIN_DASH_TOKEN", "").strip()  # set this in Render env!
 
 
 # =========================
@@ -64,6 +73,7 @@ MIN_CONFIDENCE = float(os.getenv("MIN_CONFIDENCE", "0.20"))
 openai_client = None
 if OPENAI_API_KEY:
     from openai import AsyncOpenAI
+
     openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
 
 
@@ -73,107 +83,70 @@ def _require_openai():
 
 
 # =========================
-# Database
+# Helpers
 # =========================
-def db() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    return conn
-
-
-def init_db():
-    conn = db()
-    cur = conn.cursor()
-
-    cur.execute("""
-      CREATE TABLE IF NOT EXISTS chunks (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        url TEXT NOT NULL,
-        title TEXT,
-        text TEXT NOT NULL,
-        embedding TEXT NOT NULL
-      )
-    """)
-
-    cur.execute("""
-      CREATE TABLE IF NOT EXISTS sessions (
-        session_id TEXT PRIMARY KEY,
-        created_at INTEGER NOT NULL
-      )
-    """)
-
-    cur.execute("""
-      CREATE TABLE IF NOT EXISTS human_messages (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        session_id TEXT NOT NULL,
-        text TEXT NOT NULL,
-        ts INTEGER NOT NULL
-      )
-    """)
-
-    # booking status: pending -> approved/denied
-    # details_json holds: { "question": "...", "page_url": "...", "history": [...],
-    #                      "customer_info": {...}, "raw_messages": [...] }
-    cur.execute("""
-      CREATE TABLE IF NOT EXISTS booking_requests (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        session_id TEXT NOT NULL,
-        status TEXT NOT NULL,
-        details_json TEXT NOT NULL,
-        created_at INTEGER NOT NULL,
-        updated_at INTEGER NOT NULL
-      )
-    """)
-
-    conn.commit()
-    conn.close()
-
-
 def now_ts() -> int:
     return int(time.time())
 
 
-def ensure_session(session_id: str):
-    conn = db()
-    cur = conn.cursor()
-    cur.execute(
-        "INSERT OR IGNORE INTO sessions(session_id, created_at) VALUES(?,?)",
-        (session_id, now_ts()),
+def escape_html(s: str) -> str:
+    return (
+        (s or "")
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+        .replace("'", "&#39;")
     )
-    conn.commit()
-    conn.close()
 
 
-def add_human_message(session_id: str, text: str):
-    conn = db()
-    cur = conn.cursor()
-    cur.execute(
-        "INSERT INTO human_messages(session_id, text, ts) VALUES(?,?,?)",
-        (session_id, text, now_ts()),
-    )
-    conn.commit()
-    conn.close()
+def cosine(a: List[float], b: List[float]) -> float:
+    if not a or not b or len(a) != len(b):
+        return 0.0
+    dot = 0.0
+    na = 0.0
+    nb = 0.0
+    for x, y in zip(a, b):
+        dot += x * y
+        na += x * x
+        nb += y * y
+    denom = math.sqrt(na) * math.sqrt(nb)
+    return (dot / denom) if denom else 0.0
 
 
-def get_human_messages(session_id: str) -> List[Dict[str, Any]]:
-    conn = db()
-    cur = conn.cursor()
-    cur.execute(
-        "SELECT text, ts FROM human_messages WHERE session_id=? ORDER BY ts ASC",
-        (session_id,),
-    )
-    rows = cur.fetchall()
-    conn.close()
-    return [{"role": "Abood Freediver Team", "text": r["text"], "ts": r["ts"]} for r in rows]
+def detect_language(text: str, accept_language: str = "") -> str:
+    """
+    Returns: 'ar' | 'de' | 'en'
+    Uses a safe heuristic (no extra dependencies).
+    """
+    t = (text or "").strip()
+
+    # Strong signal: Arabic characters
+    if re.search(r"[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF\uFB50-\uFDFF\uFE70-\uFEFF]", t):
+        return "ar"
+
+    # Accept-Language header hint
+    al = (accept_language or "").lower()
+    if "ar" in al:
+        return "ar"
+    if "de" in al:
+        return "de"
+    if "en" in al:
+        return "en"
+
+    # German hints
+    if re.search(r"[äöüßÄÖÜ]", t) or re.search(r"\b(und|oder|bitte|preise|kurs|tauchen|freitauchen)\b", t.lower()):
+        return "de"
+
+    return "en"
 
 
-def chunks_count() -> int:
-    conn = db()
-    cur = conn.cursor()
-    cur.execute("SELECT COUNT(*) AS n FROM chunks")
-    n = cur.fetchone()["n"]
-    conn.close()
-    return int(n)
+def booking_form_url(lang: str) -> str:
+    if lang == "ar":
+        return FORM_AR_URL
+    if lang == "de":
+        return FORM_DE_URL
+    return FORM_EN_URL
 
 
 # =========================
@@ -192,10 +165,7 @@ def send_email(to_email: str, subject: str, html: str):
         "subject": subject,
         "content": [{"type": "text/html", "value": html}],
     }
-    headers = {
-        "Authorization": f"Bearer {SENDGRID_API_KEY}",
-        "Content-Type": "application/json",
-    }
+    headers = {"Authorization": f"Bearer {SENDGRID_API_KEY}", "Content-Type": "application/json"}
     r = requests.post(url, headers=headers, data=json.dumps(payload), timeout=20)
     if r.status_code >= 300:
         raise RuntimeError(f"SendGrid error {r.status_code}: {r.text}")
@@ -207,61 +177,104 @@ def safe_send_owner_email(subject: str, html: str):
     try:
         send_email(OWNER_NOTIFY_EMAIL, subject, html)
     except Exception:
-        # do not break user flow
         pass
 
 
 # =========================
-# Utilities (text + retrieval)
+# Database
 # =========================
-def cosine(a: List[float], b: List[float]) -> float:
-    if not a or not b or len(a) != len(b):
-        return 0.0
-    dot = 0.0
-    na = 0.0
-    nb = 0.0
-    for x, y in zip(a, b):
-        dot += x * y
-        na += x * x
-        nb += y * y
-    denom = math.sqrt(na) * math.sqrt(nb)
-    return (dot / denom) if denom else 0.0
+def db() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    return conn
 
 
-def strip_text(html: str) -> Tuple[str, str]:
-    soup = BeautifulSoup(html, "html.parser")
-    for tag in soup(["script", "style", "noscript", "svg"]):
-        tag.decompose()
-    title = soup.title.string.strip() if soup.title and soup.title.string else ""
-    text = soup.get_text(separator="\n")
-    lines = [ln.strip() for ln in text.splitlines()]
-    lines = [ln for ln in lines if ln]
-    cleaned = "\n".join(lines)
-    return title, cleaned
+def init_db():
+    conn = db()
+    cur = conn.cursor()
+
+    cur.execute(
+        """
+      CREATE TABLE IF NOT EXISTS chunks (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        url TEXT NOT NULL,
+        title TEXT,
+        text TEXT NOT NULL,
+        embedding TEXT NOT NULL
+      )
+    """
+    )
+
+    cur.execute(
+        """
+      CREATE TABLE IF NOT EXISTS sessions (
+        session_id TEXT PRIMARY KEY,
+        created_at INTEGER NOT NULL
+      )
+    """
+    )
+
+    cur.execute(
+        """
+      CREATE TABLE IF NOT EXISTS human_messages (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        session_id TEXT NOT NULL,
+        text TEXT NOT NULL,
+        ts INTEGER NOT NULL
+      )
+    """
+    )
+
+    # booking status: pending -> approved/denied -> completed
+    cur.execute(
+        """
+      CREATE TABLE IF NOT EXISTS booking_requests (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        session_id TEXT NOT NULL,
+        status TEXT NOT NULL,
+        details_json TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+      )
+    """
+    )
+
+    conn.commit()
+    conn.close()
 
 
-def chunk_text(text: str, chunk_chars: int, overlap: int) -> List[str]:
-    if len(text) <= chunk_chars:
-        return [text]
-    chunks = []
-    start = 0
-    while start < len(text) and len(chunks) < MAX_CHUNKS:
-        end = min(len(text), start + chunk_chars)
-        chunks.append(text[start:end])
-        start = max(0, end - overlap)
-        if end == len(text):
-            break
-    return chunks
+def ensure_session(session_id: str):
+    conn = db()
+    cur = conn.cursor()
+    cur.execute("INSERT OR IGNORE INTO sessions(session_id, created_at) VALUES(?,?)", (session_id, now_ts()))
+    conn.commit()
+    conn.close()
 
 
-def looks_like_booking(q: str) -> bool:
-    ql = (q or "").lower()
-    triggers = [
-        "book", "booking", "reserve", "reservation", "schedule",
-        "fun dive", "course", "training", "session", "availability",
-        "price", "join", "padi"
-    ]
-    return any(t in ql for t in triggers)
+def add_human_message(session_id: str, text: str):
+    conn = db()
+    cur = conn.cursor()
+    cur.execute("INSERT INTO human_messages(session_id, text, ts) VALUES(?,?,?)", (session_id, text, now_ts()))
+    conn.commit()
+    conn.close()
+
+
+def get_human_messages(session_id: str) -> List[Dict[str, Any]]:
+    conn = db()
+    cur = conn.cursor()
+    cur.execute("SELECT text, ts FROM human_messages WHERE session_id=? ORDER BY ts ASC", (session_id,))
+    rows = cur.fetchall()
+    conn.close()
+    return [{"role": "Abood Freediver Team", "text": r["text"], "ts": r["ts"]} for r in rows]
+
+
+def chunks_count() -> int:
+    conn = db()
+    cur = conn.cursor()
+    cur.execute("SELECT COUNT(*) AS n FROM chunks")
+    n = cur.fetchone()["n"]
+    conn.close()
+    return int(n)
 
 
 # =========================
@@ -269,17 +282,11 @@ def looks_like_booking(q: str) -> bool:
 # =========================
 async def embed_text(text: str) -> List[float]:
     _require_openai()
-    resp = await openai_client.embeddings.create(
-        model=OPENAI_EMBED_MODEL,
-        input=text[:6000],
-    )
+    resp = await openai_client.embeddings.create(model=OPENAI_EMBED_MODEL, input=text[:6000])
     return list(resp.data[0].embedding)
 
 
 async def generate_answer(system: str, user: str) -> str:
-    """
-    Use chat.completions for gpt-4o-mini (supports temperature).
-    """
     _require_openai()
     resp = await openai_client.chat.completions.create(
         model=OPENAI_CHAT_MODEL,
@@ -322,7 +329,6 @@ async def retrieve_site_context(question: str) -> Tuple[List[Dict[str, Any]], fl
     scored.sort(key=lambda x: x[0], reverse=True)
     top = scored[:TOP_K]
     confidence = float(top[0][0]) if top else 0.0
-
     chunks = [{"score": s, "url": u, "title": (t or ""), "text": tx} for (s, u, t, tx) in top]
     return chunks, confidence
 
@@ -344,11 +350,13 @@ def serpapi_search(query: str) -> List[Dict[str, str]]:
         data = r.json()
         out = []
         for item in data.get("organic_results", [])[:5]:
-            out.append({
-                "title": item.get("title", ""),
-                "link": item.get("link", ""),
-                "snippet": item.get("snippet", ""),
-            })
+            out.append(
+                {
+                    "title": item.get("title", ""),
+                    "link": item.get("link", ""),
+                    "snippet": item.get("snippet", ""),
+                }
+            )
         return out
     except Exception:
         return []
@@ -357,32 +365,24 @@ def serpapi_search(query: str) -> List[Dict[str, str]]:
 # =========================
 # Booking flow
 # =========================
-REQUIRED_BOOKING_FIELDS = [
-    "full_name",
-    "age",
-    "whatsapp_or_phone",
-    "email",
-    "session_type",  # training | fun_dive
-    "date_time",
-    "people_count",
-    "certification_status",  # certified | not_certified
-    "certification_copy_required",  # yes/no
-    "id_copy_required",  # yes/no
-    "height_cm",
-    "weight_kg",
-    "feet_size",
-    "need_equipment",  # yes/no
-    "underwater_photography",  # none | action | pro
-    "payment_method",  # cash_arrival | online
-]
-
-FUN_DIVE_EXTRA_FIELDS = [
-    "preferred_dive_site",
-]
-
-TRAINING_EXTRA_FIELDS = [
-    "training_focus",
-]
+def looks_like_booking(q: str) -> bool:
+    ql = (q or "").lower()
+    triggers = [
+        "book",
+        "booking",
+        "reserve",
+        "reservation",
+        "schedule",
+        "fun dive",
+        "course",
+        "training",
+        "session",
+        "availability",
+        "price",
+        "join",
+        "padi",
+    ]
+    return any(t in ql for t in triggers)
 
 
 def create_booking_request(session_id: str, details: Dict[str, Any]) -> int:
@@ -410,7 +410,6 @@ def update_booking(booking_id: int, status: Optional[str] = None, details: Optio
     new_status = status or row["status"]
     current_details = json.loads(row["details_json"] or "{}")
     if details:
-        # shallow merge
         current_details.update(details)
 
     cur.execute(
@@ -461,95 +460,17 @@ def make_approval_links(base_url: str, booking_id: int) -> Tuple[str, str]:
     return approve, deny
 
 
-def booking_missing_fields(details: Dict[str, Any]) -> List[str]:
-    info = (details or {}).get("customer_info") or {}
-    missing = [k for k in REQUIRED_BOOKING_FIELDS if not info.get(k)]
-    st = (info.get("session_type") or "").lower().strip()
-
-    if st == "fun_dive":
-        missing += [k for k in FUN_DIVE_EXTRA_FIELDS if not info.get(k)]
-        # for fun dive, certification copy is mandatory
-        if info.get("certification_status") != "certified":
-            # if not certified, they should not book fun dive; keep it missing as signal
-            if "certification_status" not in missing:
-                missing.append("certification_status")
-        if not info.get("certification_copy_required"):
-            missing.append("certification_copy_required")
-
-    if st == "training":
-        missing += [k for k in TRAINING_EXTRA_FIELDS if not info.get(k)]
-
-    # de-dup preserve order
-    seen = set()
-    out = []
-    for m in missing:
-        if m not in seen:
-            seen.add(m)
-            out.append(m)
-    return out
-
-
-def simple_extract_customer_info(text: str) -> Dict[str, Any]:
-    """
-    Minimal extraction (no LLM). This keeps your system stable and still useful.
-    Customer can reply using the template; we store raw and extract what we can.
-    """
-    t = (text or "").strip()
-
-    phone = None
-    m = re.search(r"(\+\d{7,15}|\b\d{9,15}\b)", t)
-    if m:
-        phone = m.group(1)
-
-    email = None
-    m = re.search(r"([A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,})", t, flags=re.I)
-    if m:
-        email = m.group(1)
-
-    # rough numbers
-    age = None
-    m = re.search(r"\bage\s*[:=]\s*(\d{1,2})\b", t, flags=re.I)
-    if m:
-        age = int(m.group(1))
-
-    people = None
-    m = re.search(r"(?:people|persons|divers|guests)\s*[:=]\s*(\d{1,2})\b", t, flags=re.I)
-    if m:
-        people = int(m.group(1))
-
-    return {
-        "whatsapp_or_phone": phone,
-        "email": email,
-        "age": age,
-        "people_count": people,
-    }
-
-
-BOOKING_TEMPLATE = """Please reply with the details below (copy/paste and fill):
-
-Full name:
-Age:
-WhatsApp/Phone:
-Email:
-Session type (training or fun_dive):
-Preferred date/time:
-Number of people:
-
-Certified? (certified or not_certified):
-If certified: upload/send certification copy (mandatory for fun dive).
-If not certified: upload/send ID copy.
-
-Height (cm):
-Weight (kg):
-Feet size:
-Need equipment? (yes/no):
-
-Underwater photography add-on? (none/action/pro):
-Payment (cash_arrival or online):
-
-If fun dive: preferred dive site (optional):
-If training: what do you want to focus on? (equalization / duck dive / relaxation / depth / technique / other):
-"""
+# =========================
+# Admin auth
+# =========================
+def require_admin(request: Request):
+    if not ADMIN_DASH_TOKEN:
+        raise HTTPException(status_code=500, detail="ADMIN_DASH_TOKEN not set")
+    given = request.headers.get("x-admin-token", "").strip()
+    if not given:
+        given = request.query_params.get("token", "").strip()
+    if given != ADMIN_DASH_TOKEN:
+        raise HTTPException(status_code=401, detail="Unauthorized")
 
 
 # =========================
@@ -577,7 +498,8 @@ class ChatResponse(BaseModel):
     answer: str
     needs_human: bool = False
     booking_pending: bool = False
-    sources: Optional[List[Dict[str, str]]] = None  # keep, but frontend can ignore
+    # Keep field for compatibility, but frontend can ignore.
+    sources: Optional[List[Dict[str, str]]] = None
 
 
 @app.on_event("startup")
@@ -600,65 +522,142 @@ def chat_status(session_id: str = Query(...)):
     return {"messages": get_human_messages(session_id)}
 
 
+# -------- Booking submit webhook (your form should POST here) --------
+# This is how you "auto-close booking after form submit".
+# Your PHP form can POST to: https://freedive-chat-backend.onrender.com/booking/submit
+@app.post("/booking/submit")
+async def booking_submit(
+    request: Request,
+    booking_id: int = Form(...),
+    full_name: str = Form(""),
+    age: str = Form(""),
+    whatsapp_or_phone: str = Form(""),
+    email: str = Form(""),
+    session_type: str = Form(""),
+    preferred_date_time: str = Form(""),
+    people_count: str = Form(""),
+    certified_status: str = Form(""),
+    height_cm: str = Form(""),
+    weight_kg: str = Form(""),
+    feet_size: str = Form(""),
+    need_equipment: str = Form(""),
+    underwater_photography: str = Form(""),
+    payment_method: str = Form(""),
+    preferred_dive_site: str = Form(""),
+    training_focus: str = Form(""),
+):
+    # If you want to protect this endpoint, set BOOKING_SUBMIT_TOKEN and check header.
+    # For now, keep it open because it comes from your website form.
+    booking = get_booking(booking_id)
+    details = booking.get("details") or {}
+
+    customer = details.get("customer_info") or {}
+    customer.update(
+        {
+            "full_name": full_name.strip(),
+            "age": age.strip(),
+            "whatsapp_or_phone": whatsapp_or_phone.strip(),
+            "email": email.strip(),
+            "session_type": session_type.strip(),
+            "date_time": preferred_date_time.strip(),
+            "people_count": people_count.strip(),
+            "certification_status": certified_status.strip(),
+            "height_cm": height_cm.strip(),
+            "weight_kg": weight_kg.strip(),
+            "feet_size": feet_size.strip(),
+            "need_equipment": need_equipment.strip(),
+            "underwater_photography": underwater_photography.strip(),
+            "payment_method": payment_method.strip(),
+            "preferred_dive_site": preferred_dive_site.strip(),
+            "training_focus": training_focus.strip(),
+        }
+    )
+
+    details["customer_info"] = customer
+    details.setdefault("form_submissions", [])
+    details["form_submissions"].append({"ts": now_ts(), "ip": request.client.host if request.client else ""})
+
+    # Auto-close booking
+    update_booking(booking_id, status="completed", details=details)
+
+    # Notify owner with all details
+    safe_send_owner_email(
+        "Booking form submitted (auto-closed)",
+        f"""
+        <h3>Booking completed</h3>
+        <p><b>Booking ID:</b> {booking_id}</p>
+        <p><b>Session:</b> {escape_html(booking.get("session_id",""))}</p>
+        <p><b>Customer info:</b></p>
+        <pre>{escape_html(json.dumps(customer, indent=2))}</pre>
+        """,
+    )
+
+    # Optional: push a human message to the chat
+    add_human_message(
+        booking["session_id"],
+        "Abood Freediver Team: Thanks — we received your booking details. We will confirm the final schedule and meeting point shortly.",
+    )
+
+    return {"ok": True, "status": "completed", "booking_id": booking_id}
+
+
 @app.post("/chat", response_model=ChatResponse)
-async def chat(req: ChatRequest):
+async def chat(req: ChatRequest, request: Request):
     if not req.question or not req.session_id:
         raise HTTPException(status_code=400, detail="question and session_id required")
 
     ensure_session(req.session_id)
     q = (req.question or "").strip()
 
-    # If there is an approved booking for this session, collect details and notify owner.
+    lang = detect_language(q, accept_language=request.headers.get("accept-language", ""))
+    form_url = booking_form_url(lang)
+
+    # If booking already approved: provide clickable form link (no complex template in chat)
     latest = get_latest_booking_for_session(req.session_id)
     if latest and latest["status"] == "approved":
-        details = latest.get("details") or {}
-        details.setdefault("raw_messages", [])
-        details["raw_messages"].append({"ts": now_ts(), "text": q})
+        booking_id = int(latest["id"])
+        link = f"{form_url}?booking_id={booking_id}&session_id={req.session_id}"
 
-        details.setdefault("customer_info", {})
-        details["customer_info"].update(simple_extract_customer_info(q))
-
-        missing = booking_missing_fields(details)
-
-        update_booking(int(latest["id"]), details=details)
-
-        # email owner every time, but include missing list (so you can follow up)
-        html = f"""
-        <h3>Approved booking details update</h3>
-        <p><b>Booking ID:</b> {latest["id"]}</p>
-        <p><b>Session:</b> {req.session_id}</p>
-        <p><b>Page:</b> {escape_html(req.page_url or "")}</p>
-        <p><b>Latest customer message:</b></p>
-        <pre>{escape_html(q)}</pre>
-        <p><b>Extracted fields (partial):</b></p>
-        <pre>{escape_html(json.dumps(details.get("customer_info", {}), indent=2))}</pre>
-        <p><b>Missing required fields:</b></p>
-        <pre>{escape_html(", ".join(missing) if missing else "None (complete)")}</pre>
-        """
-        safe_send_owner_email("Approved booking: details update", html)
-
-        if missing:
-            answer = (
-                "This is the Abood Freediver Team. Thanks — your booking is approved.\n\n"
-                "To finalize, please provide the remaining details using this template:\n\n"
-                f"{BOOKING_TEMPLATE}"
+        if lang == "ar":
+            msg = (
+                "فريق عبود فريدايفر: تمّت الموافقة على طلب الحجز.\n\n"
+                f"لإكمال الحجز، رجاءً افتح الرابط واملأ النموذج:\n{link}\n\n"
+                "إذا لديك أي سؤال آخر، اكتب هنا وسنساعدك."
             )
-            return ChatResponse(answer=answer, needs_human=True, booking_pending=True, sources=[])
+        elif lang == "de":
+            msg = (
+                "Abood Freediver Team: Deine Buchung wurde genehmigt.\n\n"
+                f"Bitte öffne den Link und fülle das Formular aus:\n{link}\n\n"
+                "Wenn du noch Fragen hast, schreibe hier weiter."
+            )
+        else:
+            msg = (
+                "Abood Freediver Team: Your booking request is approved.\n\n"
+                f"Please open this link and complete the form:\n{link}\n\n"
+                "If you have any other questions, you can continue chatting here."
+            )
 
-        # complete
-        answer = (
-            "This is the Abood Freediver Team. Perfect — we have all required details.\n\n"
-            "We will confirm the final schedule, meeting point, and payment instructions shortly."
+        # notify owner that user was sent to form
+        safe_send_owner_email(
+            "Booking approved: form link sent",
+            f"""
+            <h3>Form link sent to customer</h3>
+            <p><b>Booking ID:</b> {booking_id}</p>
+            <p><b>Session:</b> {escape_html(req.session_id)}</p>
+            <p><b>Language:</b> {escape_html(lang)}</p>
+            <p><b>Form link:</b> <a href="{escape_html(link)}">{escape_html(link)}</a></p>
+            """,
         )
-        return ChatResponse(answer=answer, needs_human=True, booking_pending=False, sources=[])
 
-    # If booking intent: create pending booking, notify owner with approve/deny links
+        return ChatResponse(answer=msg, needs_human=True, booking_pending=True, sources=[])
+
+    # Booking intent -> create pending booking, notify owner, tell user "pending"
     if looks_like_booking(q):
         booking_details = {
             "question": q,
             "page_url": req.page_url or "",
             "history": req.history or [],
-            "customer_info": {},
+            "language": lang,
             "raw_messages": [{"ts": now_ts(), "text": q}],
         }
         booking_id = create_booking_request(req.session_id, booking_details)
@@ -672,26 +671,36 @@ async def chat(req: ChatRequest):
             f"""
             <h3>Booking request pending approval</h3>
             <p><b>Booking ID:</b> {booking_id}</p>
-            <p><b>Session:</b> {req.session_id}</p>
+            <p><b>Session:</b> {escape_html(req.session_id)}</p>
             <p><b>Page:</b> {escape_html(req.page_url or "")}</p>
             <p><b>User message:</b></p>
             <pre>{escape_html(q)}</pre>
+            <p><b>Language:</b> {escape_html(lang)}</p>
             <p><b>Approve:</b> <a href="{approve}">{approve}</a></p>
             <p><b>Deny:</b> <a href="{deny}">{deny}</a></p>
             """,
         )
 
-        return ChatResponse(
-            answer=(
-                "This is the Abood Freediver Team. I can take your booking request, "
-                "but I can only confirm after instructor approval.\n\n"
-                "Please share these details (copy/paste and fill):\n\n"
-                f"{BOOKING_TEMPLATE}"
-            ),
-            needs_human=True,
-            booking_pending=True,
-            sources=[],
-        )
+        if lang == "ar":
+            msg = (
+                "فريق عبود فريدايفر: استلمنا طلب الحجز.\n"
+                "لا يمكننا تأكيد الحجز إلا بعد موافقة المدرب.\n\n"
+                "سوف نرسل لك رابط نموذج التفاصيل بعد الموافقة."
+            )
+        elif lang == "de":
+            msg = (
+                "Abood Freediver Team: Wir haben deine Buchungsanfrage erhalten.\n"
+                "Wir können erst nach Freigabe durch den Instructor bestätigen.\n\n"
+                "Nach der Freigabe schicken wir dir einen Link zum Formular."
+            )
+        else:
+            msg = (
+                "Abood Freediver Team: We received your booking request.\n"
+                "We can only confirm after instructor approval.\n\n"
+                "After approval, we will send you a link to a short form to collect details."
+            )
+
+        return ChatResponse(answer=msg, needs_human=True, booking_pending=True, sources=[])
 
     # Normal Q&A (RAG)
     chunks, conf = await retrieve_site_context(q)
@@ -702,15 +711,14 @@ async def chat(req: ChatRequest):
         "Rules:\n"
         "- Prefer answering using SITE_CONTEXT.\n"
         "- If SITE_CONTEXT is insufficient, you may use WEB_CONTEXT if provided.\n"
-        "- Never confirm a booking unless it is already approved in the system.\n"
+        "- Never confirm a booking unless it is approved.\n"
         "- Keep answers concise, accurate, and safety-conscious.\n"
-        "- Do not mention internal embeddings, databases, or implementation details.\n"
+        "- Do not show sources unless the user explicitly asks for sources.\n"
+        "- Do not mention internal implementation.\n"
     )
 
-    sources = []
     site_context = ""
     for c in chunks:
-        sources.append({"title": c["title"] or "Website page", "url": c["url"]})
         site_context += f"\n\nSOURCE: {c['url']}\n{c['text'][:2000]}"
 
     web_results = serpapi_search(q) if conf < MIN_CONFIDENCE else []
@@ -724,19 +732,44 @@ async def chat(req: ChatRequest):
         f"WEB_CONTEXT:\n{web_context if web_context else '(none)'}\n\n"
         "TASK:\n"
         "- Answer the user question.\n"
-        "- If you use website info, you may internally rely on it, but do not show 'Sources' unless asked.\n"
-        "- If info is missing, ask a short follow-up question.\n"
+        "- If information is missing, ask 1 short follow-up question.\n"
+        "- Do not include a Sources section.\n"
     )
 
     answer = await generate_answer(system, prompt)
-
-    return ChatResponse(answer=answer, needs_human=False, booking_pending=False, sources=sources[:4])
-
-
-def escape_html(s: str) -> str:
-    return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
+    return ChatResponse(answer=answer, needs_human=False, booking_pending=False, sources=[])
 
 
+# =========================
+# Admin endpoints (dashboard backend)
+# =========================
+@app.get("/admin/bookings")
+def admin_list_bookings(request: Request, status: str = Query(default="")):
+    require_admin(request)
+    conn = db()
+    cur = conn.cursor()
+    if status:
+        rows = cur.execute(
+            "SELECT id, session_id, status, created_at, updated_at FROM booking_requests WHERE status=? ORDER BY created_at DESC",
+            (status,),
+        ).fetchall()
+    else:
+        rows = cur.execute(
+            "SELECT id, session_id, status, created_at, updated_at FROM booking_requests ORDER BY created_at DESC"
+        ).fetchall()
+    conn.close()
+    return {"bookings": [dict(r) for r in rows]}
+
+
+@app.get("/admin/bookings/{booking_id}")
+def admin_get_booking(booking_id: int, request: Request):
+    require_admin(request)
+    return get_booking(booking_id)
+
+
+# =========================
+# Approval links
+# =========================
 @app.get("/admin/booking/approve")
 def approve_booking(token: str = Query(...)):
     try:
@@ -749,24 +782,19 @@ def approve_booking(token: str = Query(...)):
 
     update_booking(booking_id, status="approved")
 
-    # user-facing confirmation + mandatory fields request
+    # Send a human message that will appear in the widget (optional)
     add_human_message(
         booking["session_id"],
-        "Abood Freediver Team: Approved. Please reply with the required details to finalize.\n\n"
-        + BOOKING_TEMPLATE
+        "Abood Freediver Team: Approved. Please continue by completing the booking form link we will provide in chat.",
     )
 
-    # owner notification
-    details = booking.get("details") or {}
     safe_send_owner_email(
         "Booking approved",
         f"""
         <h3>Booking approved</h3>
         <p><b>Booking ID:</b> {booking_id}</p>
         <p><b>Session:</b> {escape_html(booking.get("session_id",""))}</p>
-        <p><b>Original request:</b></p>
-        <pre>{escape_html((details.get("question") or ""))}</pre>
-        <p>The customer will now be asked for mandatory info.</p>
+        <p>The customer will receive the form link in chat when they message next.</p>
         """,
     )
 
@@ -787,8 +815,7 @@ def deny_booking(token: str = Query(...)):
 
     add_human_message(
         booking["session_id"],
-        "Abood Freediver Team: We can’t confirm that booking request yet. "
-        "Please share alternative dates/times and your experience level."
+        "Abood Freediver Team: We can’t confirm that booking request yet. Please share alternative dates/times and your experience level.",
     )
 
     safe_send_owner_email(
