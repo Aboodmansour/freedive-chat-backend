@@ -16,6 +16,7 @@ from pydantic import BaseModel
 
 from bs4 import BeautifulSoup
 from itsdangerous import URLSafeSerializer, BadSignature
+from openai import AsyncOpenAI
 
 # =========================
 # Load .env (local only)
@@ -29,20 +30,17 @@ if env_path.exists():
 # =========================
 OWNER_NOTIFY_EMAIL = os.getenv("OWNER_NOTIFY_EMAIL", "").strip()
 SENDGRID_API_KEY = os.getenv("SENDGRID_API_KEY", "").strip()
+SMTP_FROM = os.getenv("SMTP_FROM", "").strip()  # optional; if empty we'll use OWNER_NOTIFY_EMAIL
+
 SERPAPI_KEY = os.getenv("SEARCHAPI_KEY", "").strip()
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 OPENAI_CHAT_MODEL = os.getenv("OPENAI_CHAT_MODEL", "gpt-4o-mini").strip()
 OPENAI_EMBED_MODEL = os.getenv("OPENAI_EMBED_MODEL", "text-embedding-3-small").strip()
 
-ALLOWED_ORIGINS = [
-    o.strip()
-    for o in os.getenv("ALLOWED_ORIGINS", "").split(",")
-    if o.strip()
-] or ["*"]
-
-ADMIN_TOKEN_SECRET = os.getenv("ADMIN_TOKEN_SECRET") or "CHANGE_ME_" + secrets.token_urlsafe(16)
-serializer = URLSafeSerializer(ADMIN_TOKEN_SECRET, salt="booking-approval")
+SITE_SITEMAP_URL = os.getenv("SITE_SITEMAP_URL", "").strip()
+SITE_BASE_URL = os.getenv("SITE_BASE_URL", "").strip()
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").strip()
 
 DB_PATH = os.getenv("DB_PATH", "data.sqlite3")
 
@@ -53,11 +51,21 @@ CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "200"))
 TOP_K = int(os.getenv("TOP_K", "6"))
 MIN_CONFIDENCE = float(os.getenv("MIN_CONFIDENCE", "0.20"))
 
-# =========================
-# OpenAI (async, modern)
-# =========================
-from openai import AsyncOpenAI
+# CORS
+ALLOWED_ORIGINS = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "").split(",") if o.strip()]
+if not ALLOWED_ORIGINS:
+    # Safer than "*" if you use cookies/credentials. Add your real domains here.
+    ALLOWED_ORIGINS = ["http://localhost:5500", "http://localhost:3000"]
+
+# Approval token
+ADMIN_TOKEN_SECRET = os.getenv("ADMIN_TOKEN_SECRET", "").strip() or ("CHANGE_ME_" + secrets.token_urlsafe(16))
+serializer = URLSafeSerializer(ADMIN_TOKEN_SECRET, salt="booking-approval")
+
+# OpenAI client
+if not OPENAI_API_KEY:
+    raise RuntimeError("OPENAI_API_KEY is not set")
 openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
+
 
 # =========================
 # Database
@@ -71,39 +79,47 @@ def db() -> sqlite3.Connection:
 def init_db():
     conn = db()
     cur = conn.cursor()
-    cur.execute("""
+    cur.execute(
+        """
         CREATE TABLE IF NOT EXISTS chunks (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            url TEXT,
+            url TEXT NOT NULL,
             title TEXT,
-            text TEXT,
-            embedding TEXT
+            text TEXT NOT NULL,
+            embedding TEXT NOT NULL
         )
-    """)
-    cur.execute("""
+        """
+    )
+    cur.execute(
+        """
         CREATE TABLE IF NOT EXISTS sessions (
             session_id TEXT PRIMARY KEY,
-            created_at INTEGER
+            created_at INTEGER NOT NULL
         )
-    """)
-    cur.execute("""
+        """
+    )
+    cur.execute(
+        """
         CREATE TABLE IF NOT EXISTS human_messages (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            session_id TEXT,
-            text TEXT,
-            ts INTEGER
+            session_id TEXT NOT NULL,
+            text TEXT NOT NULL,
+            ts INTEGER NOT NULL
         )
-    """)
-    cur.execute("""
+        """
+    )
+    cur.execute(
+        """
         CREATE TABLE IF NOT EXISTS booking_requests (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            session_id TEXT,
-            status TEXT,
-            details_json TEXT,
-            created_at INTEGER,
-            updated_at INTEGER
+            session_id TEXT NOT NULL,
+            status TEXT NOT NULL, -- pending|approved|denied
+            details_json TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL
         )
-    """)
+        """
+    )
     conn.commit()
     conn.close()
 
@@ -111,10 +127,10 @@ def init_db():
 def chunks_count() -> int:
     conn = db()
     cur = conn.cursor()
-    cur.execute("SELECT COUNT(*) FROM chunks")
-    n = cur.fetchone()[0]
+    cur.execute("SELECT COUNT(*) AS n FROM chunks")
+    n = cur.fetchone()["n"]
     conn.close()
-    return n
+    return int(n)
 
 
 # =========================
@@ -125,61 +141,227 @@ def now_ts() -> int:
 
 
 def cosine(a: List[float], b: List[float]) -> float:
-    dot = sum(x * y for x, y in zip(a, b))
-    na = math.sqrt(sum(x * x for x in a))
-    nb = math.sqrt(sum(y * y for y in b))
-    return dot / (na * nb) if na and nb else 0.0
+    if not a or not b or len(a) != len(b):
+        return 0.0
+    dot = 0.0
+    na = 0.0
+    nb = 0.0
+    for x, y in zip(a, b):
+        dot += x * y
+        na += x * x
+        nb += y * y
+    denom = math.sqrt(na) * math.sqrt(nb)
+    return (dot / denom) if denom else 0.0
 
 
 def strip_text(html: str) -> Tuple[str, str]:
     soup = BeautifulSoup(html, "html.parser")
-    for t in soup(["script", "style", "noscript", "svg"]):
-        t.decompose()
-    title = soup.title.string.strip() if soup.title and soup.title.string else ""
-    text = "\n".join(l.strip() for l in soup.get_text("\n").splitlines() if l.strip())
-    return title, text
+    for tag in soup(["script", "style", "noscript", "svg"]):
+        tag.decompose()
+
+    title = ""
+    if soup.title and soup.title.string:
+        title = soup.title.string.strip()
+
+    text = soup.get_text(separator="\n")
+    lines = [ln.strip() for ln in text.splitlines()]
+    lines = [ln for ln in lines if ln]
+    cleaned = "\n".join(lines)
+    return title, cleaned
 
 
-def chunk_text(text: str) -> List[str]:
+def chunk_text(text: str, chunk_chars: int, overlap: int) -> List[str]:
+    if len(text) <= chunk_chars:
+        return [text]
     chunks = []
-    i = 0
-    while i < len(text) and len(chunks) < MAX_CHUNKS:
-        end = min(len(text), i + CHUNK_CHARS)
-        chunks.append(text[i:end])
-        i = end - CHUNK_OVERLAP
+    start = 0
+    while start < len(text) and len(chunks) < MAX_CHUNKS:
+        end = min(len(text), start + chunk_chars)
+        chunks.append(text[start:end])
+        start = max(0, end - overlap)
+        if end == len(text):
+            break
     return chunks
+
+
+def looks_like_booking(q: str) -> bool:
+    ql = (q or "").lower()
+    triggers = [
+        "book",
+        "booking",
+        "reserve",
+        "reservation",
+        "schedule",
+        "join course",
+        "lesson",
+        "class",
+        "training",
+        "session",
+        "availability",
+        "price",
+        "tomorrow",
+    ]
+    return any(t in ql for t in triggers)
+
+
+def wants_human(q: str) -> bool:
+    ql = (q or "").lower()
+    triggers = ["human", "real person", "abood", "instructor", "call me", "contact", "whatsapp", "agent"]
+    return any(t in ql for t in triggers)
+
+
+def is_medical_or_high_risk(q: str) -> bool:
+    ql = (q or "").lower()
+    triggers = ["faint", "blackout", "lung", "pain", "injury", "blood", "doctor", "medical", "pregnan", "asthma"]
+    return any(t in ql for t in triggers)
 
 
 # =========================
 # OpenAI helpers
 # =========================
 async def embed_text(text: str) -> List[float]:
-    resp = await openai_client.embeddings.create(
-        model=OPENAI_EMBED_MODEL,
-        input=text[:6000],
-    )
-    return resp.data[0].embedding
+    try:
+        resp = await openai_client.embeddings.create(
+            model=OPENAI_EMBED_MODEL,
+            input=(text or "")[:6000],
+        )
+        return list(resp.data[0].embedding)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"OpenAI embeddings failed: {str(e)}")
 
 
 async def generate_answer(system: str, user: str) -> str:
-    resp = await openai_client.responses.create(
-        model=OPENAI_CHAT_MODEL,
-        input=[
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-        ],
-        temperature=0.2,
-    )
-    return resp.output_text.strip()
+    # Use chat.completions for gpt-4o-mini (stable + supports temperature)
+    try:
+        resp = await openai_client.chat.completions.create(
+            model=OPENAI_CHAT_MODEL,
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            temperature=0.2,
+        )
+        return (resp.choices[0].message.content or "").strip()
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"OpenAI chat failed: {str(e)}")
 
 
 # =========================
-# Retrieval (FIXED)
+# SendGrid email
 # =========================
-async def retrieve_site_context(
-    question: str
-) -> Tuple[List[Dict[str, Any]], float]:
+def send_email(to_email: str, subject: str, html: str):
+    if not SENDGRID_API_KEY:
+        raise RuntimeError("SENDGRID_API_KEY not set")
+    if not to_email:
+        raise RuntimeError("OWNER_NOTIFY_EMAIL not set")
 
+    from_email = SMTP_FROM or to_email
+    payload = {
+        "personalizations": [{"to": [{"email": to_email}]}],
+        "from": {"email": from_email},
+        "subject": subject,
+        "content": [{"type": "text/html", "value": html}],
+    }
+    headers = {"Authorization": f"Bearer {SENDGRID_API_KEY}", "Content-Type": "application/json"}
+    r = requests.post("https://api.sendgrid.com/v3/mail/send", headers=headers, data=json.dumps(payload), timeout=20)
+    if r.status_code >= 300:
+        raise RuntimeError(f"SendGrid error {r.status_code}: {r.text}")
+
+
+# =========================
+# SerpAPI (safe)
+# =========================
+def serpapi_search(query: str) -> List[Dict[str, str]]:
+    if not SERPAPI_KEY:
+        return []
+    try:
+        r = requests.get(
+            "https://serpapi.com/search.json",
+            params={"engine": "google", "q": query, "api_key": SERPAPI_KEY, "num": 5},
+            timeout=15,
+        )
+        if r.status_code != 200:
+            return []
+        data = r.json()
+        out = []
+        for item in data.get("organic_results", [])[:5]:
+            out.append(
+                {
+                    "title": item.get("title", ""),
+                    "link": item.get("link", ""),
+                    "snippet": item.get("snippet", ""),
+                }
+            )
+        return out
+    except Exception:
+        return []
+
+
+# =========================
+# Indexing (sitemap -> pages -> chunks -> embeddings)
+# =========================
+def parse_sitemap_urls(xml_text: str, site_base_url: str) -> List[str]:
+    soup = BeautifulSoup(xml_text, "xml")
+    locs = [loc.get_text(strip=True) for loc in soup.find_all("loc")]
+    seen = set()
+    urls = []
+    for u in locs:
+        if u in seen:
+            continue
+        if site_base_url and not u.startswith(site_base_url):
+            continue
+        seen.add(u)
+        urls.append(u)
+        if len(urls) >= MAX_URLS:
+            break
+    return urls
+
+
+async def build_index():
+    if not SITE_SITEMAP_URL:
+        print("SITE_SITEMAP_URL not set; skipping indexing.")
+        return
+
+    print("Fetching sitemap:", SITE_SITEMAP_URL)
+    r = requests.get(SITE_SITEMAP_URL, timeout=30)
+    r.raise_for_status()
+
+    urls = parse_sitemap_urls(r.text, SITE_BASE_URL)
+    print(f"Sitemap URLs: {len(urls)} (capped by MAX_URLS)")
+
+    conn = db()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM chunks")
+    conn.commit()
+
+    for idx, url in enumerate(urls):
+        try:
+            pr = requests.get(url, timeout=25, headers={"User-Agent": "AboodFreediverBot/1.0"})
+            if pr.status_code >= 400:
+                continue
+            title, text = strip_text(pr.text)
+            if not text or len(text) < 200:
+                continue
+
+            chunks = chunk_text(text, CHUNK_CHARS, CHUNK_OVERLAP)
+            for ch in chunks:
+                emb = await embed_text(ch)
+                cur.execute(
+                    "INSERT INTO chunks(url,title,text,embedding) VALUES(?,?,?,?)",
+                    (url, title, ch, json.dumps(emb)),
+                )
+            conn.commit()
+        except Exception as e:
+            print("Index error:", url, str(e))
+
+        if (idx + 1) % 10 == 0:
+            print(f"Indexed {idx+1}/{len(urls)} pages")
+
+    conn.close()
+    print("Index build complete.")
+
+
+async def retrieve_site_context(question: str) -> Tuple[List[Dict[str, Any]], float]:
     if chunks_count() == 0:
         return [], 0.0
 
@@ -205,51 +387,97 @@ async def retrieve_site_context(
 
     scored.sort(key=lambda x: x[0], reverse=True)
     top = scored[:TOP_K]
-    confidence = top[0][0]
+    confidence = float(top[0][0]) if top else 0.0
 
-    chunks = [
-        {"score": s, "url": u, "title": t or "", "text": tx}
-        for s, u, t, tx in top
-    ]
+    chunks = [{"score": s, "url": u, "title": (t or ""), "text": tx} for (s, u, t, tx) in top]
     return chunks, confidence
 
 
 # =========================
-# SerpAPI (SAFE)
+# Sessions + human messages
 # =========================
-def serpapi_search(query: str) -> List[Dict[str, str]]:
-    if not SERPAPI_KEY:
-        return []
-    try:
-        r = requests.get(
-            "https://serpapi.com/search.json",
-            params={"engine": "google", "q": query, "api_key": SERPAPI_KEY},
-            timeout=15,
-        )
-        if r.status_code != 200:
-            return []
-        data = r.json()
-        return [
-            {
-                "title": i.get("title", ""),
-                "link": i.get("link", ""),
-                "snippet": i.get("snippet", ""),
-            }
-            for i in data.get("organic_results", [])[:5]
-        ]
-    except Exception:
-        return []
+def ensure_session(session_id: str):
+    conn = db()
+    cur = conn.cursor()
+    cur.execute("INSERT OR IGNORE INTO sessions(session_id, created_at) VALUES(?,?)", (session_id, now_ts()))
+    conn.commit()
+    conn.close()
+
+
+def add_human_message(session_id: str, text: str):
+    conn = db()
+    cur = conn.cursor()
+    cur.execute("INSERT INTO human_messages(session_id, text, ts) VALUES(?,?,?)", (session_id, text, now_ts()))
+    conn.commit()
+    conn.close()
+
+
+def get_human_messages(session_id: str) -> List[Dict[str, Any]]:
+    conn = db()
+    cur = conn.cursor()
+    cur.execute("SELECT text, ts FROM human_messages WHERE session_id=? ORDER BY ts ASC", (session_id,))
+    rows = cur.fetchall()
+    conn.close()
+    return [{"role": "Abood Freediver Team", "text": r["text"], "ts": r["ts"]} for r in rows]
 
 
 # =========================
-# FastAPI
+# Booking flow
 # =========================
-app = FastAPI(title="Freedive Chat Backend")
+def create_booking_request(session_id: str, details: Dict[str, Any]) -> int:
+    conn = db()
+    cur = conn.cursor()
+    ts = now_ts()
+    cur.execute(
+        "INSERT INTO booking_requests(session_id,status,details_json,created_at,updated_at) VALUES(?,?,?,?,?)",
+        (session_id, "pending", json.dumps(details), ts, ts),
+    )
+    conn.commit()
+    booking_id = cur.lastrowid
+    conn.close()
+    return int(booking_id)
+
+
+def update_booking_status(booking_id: int, status: str):
+    conn = db()
+    cur = conn.cursor()
+    cur.execute("UPDATE booking_requests SET status=?, updated_at=? WHERE id=?", (status, now_ts(), booking_id))
+    conn.commit()
+    conn.close()
+
+
+def get_booking(booking_id: int) -> Dict[str, Any]:
+    conn = db()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM booking_requests WHERE id=?", (booking_id,))
+    row = cur.fetchone()
+    conn.close()
+    if not row:
+        raise HTTPException(status_code=404, detail="Booking not found")
+    return dict(row)
+
+
+def make_approval_links(base_url: str, booking_id: int) -> Tuple[str, str]:
+    token = serializer.dumps({"booking_id": booking_id})
+    approve = f"{base_url}/admin/booking/approve?token={token}"
+    deny = f"{base_url}/admin/booking/deny?token={token}"
+    return approve, deny
+
+
+# =========================
+# FastAPI app
+# =========================
+app = FastAPI(title="Abood Freediver Chat Backend")
+
+# If you ever set "*" origins, credentials must be False.
+allow_credentials = True
+if "*" in ALLOWED_ORIGINS:
+    allow_credentials = False
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
-    allow_credentials=True,
+    allow_credentials=allow_credentials,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -258,7 +486,7 @@ app.add_middleware(
 class ChatRequest(BaseModel):
     question: str
     session_id: str
-    history: Optional[list] = None
+    history: Optional[List[Dict[str, Any]]] = None
     page_url: Optional[str] = None
 
 
@@ -266,12 +494,24 @@ class ChatResponse(BaseModel):
     answer: str
     needs_human: bool = False
     booking_pending: bool = False
-    sources: Optional[list] = None
+    sources: Optional[List[Dict[str, str]]] = None  # you can ignore on frontend
+
+
+index_task = None
 
 
 @app.on_event("startup")
-async def startup():
+async def on_startup():
+    global index_task
     init_db()
+    # Build index in background only if empty and sitemap configured
+    if chunks_count() == 0 and SITE_SITEMAP_URL:
+        index_task = asyncio.create_task(build_index())
+
+
+@app.get("/")
+def root():
+    return {"status": "ok"}
 
 
 @app.get("/health")
@@ -281,40 +521,191 @@ def health():
 
 @app.post("/chat", response_model=ChatResponse)
 async def chat(req: ChatRequest):
-    chunks, conf = await retrieve_site_context(req.question)
+    if not req.question or not req.session_id:
+        raise HTTPException(status_code=400, detail="question and session_id required")
 
+    ensure_session(req.session_id)
+    q = req.question.strip()
+
+    # Human takeover / safety
+    if is_medical_or_high_risk(q) or wants_human(q):
+        if OWNER_NOTIFY_EMAIL and SENDGRID_API_KEY:
+            try:
+                send_email(
+                    OWNER_NOTIFY_EMAIL,
+                    "Abood Freediver: Human help requested",
+                    f"""
+                    <h3>Human help requested</h3>
+                    <p><b>Session:</b> {req.session_id}</p>
+                    <p><b>Page:</b> {req.page_url or ''}</p>
+                    <p><b>User message:</b> {q}</p>
+                    """,
+                )
+            except Exception as e:
+                print("Email notify failed:", str(e))
+
+        return ChatResponse(
+            answer=(
+                "Thanks — this is the Abood Freediver team. "
+                "For safety and accuracy, Abood will reply directly. "
+                "Please share your name and preferred contact (WhatsApp or email)."
+            ),
+            needs_human=True,
+            booking_pending=False,
+            sources=[],
+        )
+
+    # Booking request -> email notify + pending
+    if looks_like_booking(q):
+        details = {"question": q, "page_url": req.page_url or "", "history": req.history or []}
+        booking_id = create_booking_request(req.session_id, details)
+
+        if OWNER_NOTIFY_EMAIL and SENDGRID_API_KEY:
+            approve, deny = ("", "")
+            if PUBLIC_BASE_URL:
+                approve, deny = make_approval_links(PUBLIC_BASE_URL, booking_id)
+            try:
+                send_email(
+                    OWNER_NOTIFY_EMAIL,
+                    "Abood Freediver: Booking request pending approval",
+                    f"""
+                    <h3>Booking request pending approval</h3>
+                    <p><b>Session:</b> {req.session_id}</p>
+                    <p><b>Page:</b> {req.page_url or ''}</p>
+                    <p><b>User message:</b> {q}</p>
+                    <p><b>Approve:</b> <a href="{approve}">{approve}</a></p>
+                    <p><b>Deny:</b> <a href="{deny}">{deny}</a></p>
+                    """,
+                )
+            except Exception as e:
+                print("Email booking notify failed:", str(e))
+
+        return ChatResponse(
+            answer=(
+                "This is the Abood Freediver team. I can take your booking request, but I can’t confirm it until Abood approves.\n\n"
+                "Please share:\n"
+                "1) Desired date(s) + time window\n"
+                "2) Course/session type\n"
+                "3) Number of people\n"
+                "4) Your contact (WhatsApp or email)\n\n"
+                "I’ve sent your request to Abood for approval."
+            ),
+            needs_human=True,
+            booking_pending=True,
+            sources=[],
+        )
+
+    # Retrieval
+    chunks, conf = await retrieve_site_context(q)
+
+    # Make the assistant always speak as Abood Freediver team
     system = (
-        "You are Aqua, a freediving assistant.\n"
-        "Use SITE_CONTEXT when available.\n"
-        "Be concise and safety-conscious."
+        "You are Aqua, the official assistant of Abood Freediver (freediving in Aqaba).\n"
+        "Identity rules:\n"
+        "- Speak as a member of the Abood Freediver team (use 'we' when appropriate).\n"
+        "- Do not claim you personally are Abood; you are the team's assistant.\n"
+        "Behavior rules:\n"
+        "- Prefer answering using SITE_CONTEXT.\n"
+        "- If SITE_CONTEXT is insufficient, you may use WEB_CONTEXT if provided.\n"
+        "- Never confirm a booking; only say it’s pending Abood’s approval.\n"
+        "- Keep answers concise, practical, and safety-conscious.\n"
     )
 
-    site_context = ""
     sources = []
-
+    site_context = ""
     for c in chunks:
-        site_context += f"\nSOURCE: {c['url']}\n{c['text'][:1500]}"
-        sources.append({"title": c["title"], "url": c["url"]})
+        sources.append({"title": c["title"] or "Website page", "url": c["url"]})
+        site_context += f"\n\nSOURCE: {c['url']}\n{c['text'][:2000]}"
 
+    web_results = serpapi_search(q) if conf < MIN_CONFIDENCE else []
     web_context = ""
-    if conf < MIN_CONFIDENCE:
-        for r in serpapi_search(req.question):
-            web_context += f"\nWEB: {r['link']}\n{r['snippet']}"
+    for r in web_results:
+        web_context += f"\n\nWEB: {r.get('title','')}\n{r.get('link','')}\n{r.get('snippet','')}"
 
-    prompt = f"""
-USER_QUESTION:
-{req.question}
-
-SITE_CONTEXT:
-{site_context or "(none)"}
-
-WEB_CONTEXT:
-{web_context or "(none)"}
-"""
+    prompt = (
+        f"USER_QUESTION:\n{q}\n\n"
+        f"SITE_CONTEXT:\n{site_context if site_context else '(none)'}\n\n"
+        f"WEB_CONTEXT:\n{web_context if web_context else '(none)'}\n\n"
+        "TASK:\n"
+        "- Answer as the Abood Freediver team assistant.\n"
+        "- If info is missing, ask 1–2 quick questions or suggest contacting us.\n"
+    )
 
     answer = await generate_answer(system, prompt)
 
-    return ChatResponse(
-        answer=answer,
-        sources=sources[:4],
+    # Keep returning sources for debugging; your frontend can simply not display them.
+    out_sources = sources[:4] if chunks and conf >= MIN_CONFIDENCE else []
+    for r in web_results[:3]:
+        if r.get("link"):
+            out_sources.append({"title": r.get("title", "Web source"), "url": r["link"]})
+
+    return ChatResponse(answer=answer, needs_human=False, booking_pending=False, sources=out_sources)
+
+
+@app.get("/chat/status")
+def chat_status(session_id: str = Query(...)):
+    return {"messages": get_human_messages(session_id)}
+
+
+@app.get("/admin/booking/approve")
+def approve_booking(token: str = Query(...)):
+    try:
+        data = serializer.loads(token)
+    except BadSignature:
+        raise HTTPException(status_code=400, detail="Invalid token")
+
+    booking_id = int(data["booking_id"])
+    booking = get_booking(booking_id)
+    update_booking_status(booking_id, "approved")
+
+    add_human_message(
+        booking["session_id"],
+        "Abood Freediver Team: Approved. Please share your full name and WhatsApp number to finalize the details.",
     )
+    return {"ok": True, "status": "approved", "booking_id": booking_id}
+
+
+@app.get("/admin/booking/deny")
+def deny_booking(token: str = Query(...)):
+    try:
+        data = serializer.loads(token)
+    except BadSignature:
+        raise HTTPException(status_code=400, detail="Invalid token")
+
+    booking_id = int(data["booking_id"])
+    booking = get_booking(booking_id)
+    update_booking_status(booking_id, "denied")
+
+    add_human_message(
+        booking["session_id"],
+        "Abood Freediver Team: Not approved yet. Please share alternative dates/times and your experience level.",
+    )
+    return {"ok": True, "status": "denied", "booking_id": booking_id}
+
+
+@app.get("/admin/index/status")
+def index_status():
+    return {"chunks": chunks_count()}
+
+
+@app.post("/admin/reindex")
+async def admin_reindex():
+    global index_task
+
+    conn = db()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM chunks")
+    conn.commit()
+    conn.close()
+
+    if index_task and not index_task.done():
+        return {"ok": True, "status": "already_running"}
+
+    index_task = asyncio.create_task(build_index())
+    return {"ok": True, "status": "started"}
+
+
+@app.get("/admin/reindex/status")
+def admin_reindex_status():
+    running = bool(index_task and not index_task.done())
+    return {"running": running, "chunks": chunks_count()}
