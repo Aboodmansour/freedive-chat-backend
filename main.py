@@ -34,7 +34,7 @@ SERPAPI_KEY = os.getenv("SEARCHAPI_KEY", "").strip()
 
 # OpenAI
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
-OPENAI_CHAT_MODEL = os.getenv("OPENAI_CHAT_MODEL", "gpt-5-nano").strip()
+OPENAI_CHAT_MODEL = os.getenv("OPENAI_CHAT_MODEL", "gpt-4o-mini").strip()
 
 # IMPORTANT:
 # If you see: "does not have access to model 'text-embedding-3-small'"
@@ -244,7 +244,7 @@ async def embed_text(text: str) -> List[float]:
                 status_code=502,
                 detail=(
                     f"OpenAI embeddings failed. Your key/project cannot access embedding model '{OPENAI_EMBED_MODEL}'. "
-                    "Set OPENAI_EMBED_MODEL to an allowed embedding model (e.g. text-embedding-3-small) and make sure it is enabled for this OpenAI project."
+                    "Set OPENAI_EMBED_MODEL to an allowed embedding model (e.g. text-embedding-3-small) or enable the model in your OpenAI project."
                 ),
             )
         raise HTTPException(status_code=502, detail=f"OpenAI embeddings failed: {msg}")
