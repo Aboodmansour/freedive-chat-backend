@@ -43,8 +43,7 @@ SITE_SITEMAP_URL = os.getenv("SITE_SITEMAP_URL", "").strip()
 SITE_BASE_URL = os.getenv("SITE_BASE_URL", "").strip()
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").strip()
 
-# Contact form URLs
-CONTACT_FORM_URL = os.getenv("CONTACT_FORM_URL", "").strip()  # single override for all languages
+CONTACT_FORM_URL = os.getenv("CONTACT_FORM_URL", "").strip()
 CONTACT_FORM_URL_EN = os.getenv("CONTACT_FORM_URL_EN", "https://www.aboodfreediver.com/form1.php").strip()
 CONTACT_FORM_URL_DE = os.getenv("CONTACT_FORM_URL_DE", "https://www.aboodfreediver.com/form1de.php").strip()
 CONTACT_FORM_URL_AR = os.getenv("CONTACT_FORM_URL_AR", "https://www.aboodfreediver.com/form1ar.php").strip()
@@ -189,11 +188,26 @@ def chunk_text(text: str, chunk_chars: int, overlap: int) -> List[str]:
     return chunks
 
 
+# Booking triggers ONLY
 def looks_like_booking(q: str) -> bool:
     ql = (q or "").lower()
+    triggers = ["book", "booking", "reserve", "reservation"]
+    return any(t in ql for t in triggers)
+
+
+def wants_new_booking(q: str) -> bool:
+    ql = (q or "").lower()
     triggers = [
-        "book", "booking", "reserve", "reservation", "schedule", "join course",
-        "lesson", "class", "training", "session", "availability", "price", "tomorrow",
+        "book again",
+        "booking again",
+        "new booking",
+        "another booking",
+        "another reservation",
+        "make another booking",
+        "make a new booking",
+        "new reservation",
+        "reserve again",
+        "reservation again",
     ]
     return any(t in ql for t in triggers)
 
@@ -267,8 +281,7 @@ def can_send_booking_email() -> bool:
         print("Booking email not sent: SENDGRID_API_KEY is empty.")
         return False
     if not PUBLIC_BASE_URL:
-        # You can still send email, but links will be empty if you don't set PUBLIC_BASE_URL
-        print("Warning: PUBLIC_BASE_URL is empty. Approve/Deny links in email will be blank.")
+        print("Warning: PUBLIC_BASE_URL is empty; approval links will be blank in emails.")
     return True
 
 # =========================
@@ -470,24 +483,20 @@ def get_latest_booking_for_session(session_id: str) -> Optional[Dict[str, Any]]:
 
 
 def detect_language_from_text(text: str) -> str:
-    """Return 'ar', 'de', or 'en' based on simple heuristics."""
     t = (text or "").strip()
     if not t:
         return "en"
 
-    # Arabic + Hebrew ranges
     if re.search(r"[\u0590-\u05FF\u0600-\u06FF\u0700-\u08FF\uFB50-\uFDFF\uFE70-\uFEFF]", t):
         return "ar"
 
-    # German hints
     if re.search(r"[äöüÄÖÜß]", t):
         return "de"
 
     lowered = t.lower()
     german_words = [
         "guten", "hallo", "bitte", "danke", "ich", "du", "sie", "wir", "und",
-        "möchte", "moechte", "kann", "können", "koennen", "zeit", "datum",
-        "uhr", "preis", "kurs", "training"
+        "möchte", "moechte", "kann", "können", "koennen", "zeit", "datum", "uhr",
     ]
     if any(re.search(rf"\b{re.escape(w)}\b", lowered) for w in german_words):
         return "de"
@@ -496,7 +505,6 @@ def detect_language_from_text(text: str) -> str:
 
 
 def detect_language(req_question: str, history: Optional[List[Dict[str, Any]]] = None) -> str:
-    """Detect language from current question + recent user history."""
     lang = detect_language_from_text(req_question)
     if lang != "en":
         return lang
@@ -510,7 +518,6 @@ def detect_language(req_question: str, history: Optional[List[Dict[str, Any]]] =
 
 
 def build_contact_form_url(page_url: str = "", lang: str = "en") -> str:
-    """Return the correct contact form URL."""
     if CONTACT_FORM_URL:
         return CONTACT_FORM_URL
 
@@ -533,8 +540,9 @@ def build_contact_form_url(page_url: str = "", lang: str = "en") -> str:
 
 def make_approval_links(base_url: str, booking_id: int) -> Tuple[str, str]:
     token = serializer.dumps({"booking_id": booking_id})
-    approve = f"{base_url.rstrip('/')}/admin/booking/approve?token={token}"
-    deny = f"{base_url.rstrip('/')}/admin/booking/deny?token={token}"
+    base = (base_url or "").rstrip("/")
+    approve = f"{base}/admin/booking/approve?token={token}"
+    deny = f"{base}/admin/booking/deny?token={token}"
     return approve, deny
 
 # =========================
@@ -601,7 +609,7 @@ async def chat(req: ChatRequest):
 
     # Human takeover / safety
     if is_medical_or_high_risk(q) or wants_human(q):
-        if can_send_booking_email():
+        if OWNER_NOTIFY_EMAIL and SENDGRID_API_KEY:
             try:
                 send_email(
                     OWNER_NOTIFY_EMAIL,
@@ -628,21 +636,22 @@ async def chat(req: ChatRequest):
             sources=[],
         )
 
-    # -------------------------------------------------
-    # Booking logic: pending until approve/deny.
-    # If latest is approved/denied and user asks again:
-    # DO NOT create a new booking. Repeat the status response.
-    # -------------------------------------------------
+    # -------------------------
+    # Booking logic
+    # -------------------------
     latest_booking = get_latest_booking_for_session(req.session_id)
 
+    # If user asks booking and we already have a booking for this session:
     if latest_booking and looks_like_booking(q):
         status = (latest_booking.get("status") or "").lower()
+
         details = {}
         try:
             details = json.loads(latest_booking.get("details_json") or "{}")
         except Exception:
             details = {}
 
+        # Pending stays pending until you approve/deny
         if status == "pending":
             return ChatResponse(
                 answer=(
@@ -656,6 +665,47 @@ async def chat(req: ChatRequest):
                 sources=[],
             )
 
+        # Approved/Denied but user explicitly requests a NEW booking -> create new pending
+        if status in ("approved", "denied") and wants_new_booking(q):
+            details2 = {"question": q, "page_url": req.page_url or "", "history": req.history or []}
+            booking_id = create_booking_request(req.session_id, details2)
+
+            if can_send_booking_email():
+                approve, deny = ("", "")
+                if PUBLIC_BASE_URL:
+                    approve, deny = make_approval_links(PUBLIC_BASE_URL, booking_id)
+                try:
+                    send_email(
+                        OWNER_NOTIFY_EMAIL,
+                        "Abood Freediver: Booking request pending approval",
+                        f"""
+                        <h3>Booking request pending approval</h3>
+                        <p><b>Session:</b> {req.session_id}</p>
+                        <p><b>Page:</b> {req.page_url or ''}</p>
+                        <p><b>User message:</b> {q}</p>
+                        <p><b>Approve:</b> <a href="{approve}">{approve}</a></p>
+                        <p><b>Deny:</b> <a href="{deny}">{deny}</a></p>
+                        """,
+                    )
+                except Exception as e:
+                    print("Email booking notify failed:", str(e))
+
+            return ChatResponse(
+                answer=(
+                    "I can take your new booking request, but I can’t confirm it until Abood approves.\n\n"
+                    "Please share:\n"
+                    "1) Desired date(s) + time window\n"
+                    "2) Number of people\n"
+                    "3) Your contact (WhatsApp or email)\n\n"
+                    "I’ve sent your request to Abood for approval."
+                ),
+                needs_human=True,
+                booking_pending=True,
+                booking_next_url=None,
+                sources=[],
+            )
+
+        # Otherwise: repeat existing status (no new booking)
         if status == "approved":
             lang = detect_language(q, req.history)
             contact_url = build_contact_form_url(details.get("page_url", req.page_url or ""), lang=lang)
@@ -675,7 +725,7 @@ async def chat(req: ChatRequest):
             return ChatResponse(
                 answer=(
                     "Sorry — we couldn’t approve that booking request.\n"
-                    "If you share alternative dates/times (and your experience level), we can check again.\n"
+                    "If you want, you can try different dates/times.\n"
                     "You can also ask any other questions here."
                 ),
                 needs_human=False,
@@ -684,10 +734,7 @@ async def chat(req: ChatRequest):
                 sources=[],
             )
 
-    # Create NEW booking only if:
-    # - User message looks like booking
-    # - And either no latest booking exists
-    # - Or latest exists but message did not trigger above (i.e., latest exists but q not booking)
+    # No booking exists yet in this session -> create pending
     if looks_like_booking(q) and not latest_booking:
         details = {"question": q, "page_url": req.page_url or "", "history": req.history or []}
         booking_id = create_booking_request(req.session_id, details)
@@ -696,7 +743,6 @@ async def chat(req: ChatRequest):
             approve, deny = ("", "")
             if PUBLIC_BASE_URL:
                 approve, deny = make_approval_links(PUBLIC_BASE_URL, booking_id)
-
             try:
                 send_email(
                     OWNER_NOTIFY_EMAIL,
@@ -718,9 +764,8 @@ async def chat(req: ChatRequest):
                 "This is the Abood Freediver team. I can take your booking request, but I can’t confirm it until Abood approves.\n\n"
                 "Please share:\n"
                 "1) Desired date(s) + time window\n"
-                "2) Course/session type\n"
-                "3) Number of people\n"
-                "4) Your contact (WhatsApp or email)\n\n"
+                "2) Number of people\n"
+                "3) Your contact (WhatsApp or email)\n\n"
                 "I’ve sent your request to Abood for approval."
             ),
             needs_human=True,
