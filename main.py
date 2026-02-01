@@ -34,14 +34,14 @@ SERPAPI_KEY = os.getenv("SEARCHAPI_KEY", "").strip()
 
 # OpenAI
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
-OPENAI_CHAT_MODEL = os.getenv("OPENAI_CHAT_MODEL", "gpt-4o-mini").strip()
+OPENAI_CHAT_MODEL = os.getenv("OPENAI_CHAT_MODEL", "gpt-5-nano").strip()
 
 # IMPORTANT:
 # If you see: "does not have access to model 'text-embedding-3-small'"
 # set OPENAI_EMBED_MODEL to a model your key/project can access (e.g. text-embedding-3-large).
 OPENAI_EMBED_MODEL = os.getenv("OPENAI_EMBED_MODEL", "text-embedding-3-small").strip()
 
-# CORSs
+# CORS
 ALLOWED_ORIGINS = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "").split(",") if o.strip()]
 if not ALLOWED_ORIGINS:
     ALLOWED_ORIGINS = ["http://localhost:5500", "http://localhost:3000"]
@@ -244,7 +244,7 @@ async def embed_text(text: str) -> List[float]:
                 status_code=502,
                 detail=(
                     f"OpenAI embeddings failed. Your key/project cannot access embedding model '{OPENAI_EMBED_MODEL}'. "
-                    "Set OPENAI_EMBED_MODEL to an allowed embedding model (e.g. text-embedding-3-small) or enable the model in your OpenAI project."
+                    "Set OPENAI_EMBED_MODEL to an allowed embedding model (e.g. text-embedding-3-small) and make sure it is enabled for this OpenAI project."
                 ),
             )
         raise HTTPException(status_code=502, detail=f"OpenAI embeddings failed: {msg}")
