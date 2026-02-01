@@ -460,7 +460,8 @@ def get_booking(booking_id: int) -> Dict[str, Any]:
     conn.close()
     if not row:
         raise HTTPException(status_code=404, detail="Booking not found")
-    return di
+    return dict(row)
+
 def get_latest_booking_for_session(session_id: str) -> Optional[Dict[str, Any]]:
     conn = db()
     cur = conn.cursor()
@@ -549,10 +550,6 @@ def build_contact_form_url(page_url: str = "", lang: str = "en") -> str:
         if m:
             return m.group(1).rstrip("/") + "/" + CONTACT_FORM_PATH.lstrip("/")
     return CONTACT_FORM_PATH
-
-
-
-ct(row)
 
 
 def make_approval_links(base_url: str, booking_id: int) -> Tuple[str, str]:
