@@ -23,20 +23,23 @@ from pydantic import BaseModel
 from bs4 import BeautifulSoup
 from itsdangerous import URLSafeSerializer, BadSignature
 
-
 # =========================
 # Config
 # =========================
 OWNER_NOTIFY_EMAIL = os.getenv("OWNER_NOTIFY_EMAIL", "").strip()
 SENDGRID_API_KEY = os.getenv("SENDGRID_API_KEY", "").strip()
 
-# SerpAPI key (you named it SEARCHAPI_KEY in Render)
+# SerpAPI key (Render: SEARCHAPI_KEY)
 SERPAPI_KEY = os.getenv("SEARCHAPI_KEY", "").strip()
 
 # OpenAI
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 OPENAI_CHAT_MODEL = os.getenv("OPENAI_CHAT_MODEL", "gpt-4o-mini").strip()
-OPENAI_EMBED_MODEL = os.getenv("OPENAI_EMBED_MODEL", "text-embedding-3-small").strip()
+
+# IMPORTANT:
+# If you see: "does not have access to model 'text-embedding-3-small'"
+# set OPENAI_EMBED_MODEL to a model your key/project can access (e.g. text-embedding-3-large).
+OPENAI_EMBED_MODEL = os.getenv("OPENAI_EMBED_MODEL", "text-embedding-3-large").strip()
 
 # CORS
 ALLOWED_ORIGINS = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "").split(",") if o.strip()]
@@ -59,14 +62,12 @@ CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "200"))
 TOP_K = int(os.getenv("TOP_K", "6"))
 MIN_CONFIDENCE = float(os.getenv("MIN_CONFIDENCE", "0.20"))
 
-
 # =========================
 # OpenAI client (async)
 # =========================
 openai_client = None
 if OPENAI_API_KEY:
     from openai import AsyncOpenAI
-
     openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
 
 
@@ -229,24 +230,49 @@ def _require_openai():
 
 async def embed_text(text: str) -> List[float]:
     _require_openai()
-    resp = await openai_client.embeddings.create(
-        model=OPENAI_EMBED_MODEL,
-        input=text[:6000],
-    )
-    return list(resp.data[0].embedding)
+    try:
+        resp = await openai_client.embeddings.create(
+            model=OPENAI_EMBED_MODEL,
+            input=text[:6000],
+        )
+        return list(resp.data[0].embedding)
+    except Exception as e:
+        # Most common production issue: model access disabled for the key/project
+        msg = str(e)
+        if "does not have access to model" in msg or "model_not_found" in msg:
+            raise HTTPException(
+                status_code=502,
+                detail=(
+                    f"OpenAI embeddings failed. Your key/project cannot access embedding model '{OPENAI_EMBED_MODEL}'. "
+                    "Set OPENAI_EMBED_MODEL to an allowed embedding model (e.g. text-embedding-3-large) or enable the model in your OpenAI project."
+                ),
+            )
+        raise HTTPException(status_code=502, detail=f"OpenAI embeddings failed: {msg}")
 
 
 async def generate_answer(system: str, user: str) -> str:
     _require_openai()
-    resp = await openai_client.chat.completions.create(
-        model=OPENAI_CHAT_MODEL,
-        messages=[
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-        ],
-        temperature=0.2,
-    )
-    return (resp.choices[0].message.content or "").strip()
+    try:
+        resp = await openai_client.chat.completions.create(
+            model=OPENAI_CHAT_MODEL,
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            temperature=0.2,
+        )
+        return (resp.choices[0].message.content or "").strip()
+    except Exception as e:
+        msg = str(e)
+        if "does not have access to model" in msg or "model_not_found" in msg:
+            raise HTTPException(
+                status_code=502,
+                detail=(
+                    f"OpenAI chat failed. Your key/project cannot access chat model '{OPENAI_CHAT_MODEL}'. "
+                    "Set OPENAI_CHAT_MODEL to an allowed model or enable it in your OpenAI project."
+                ),
+            )
+        raise HTTPException(status_code=502, detail=f"OpenAI chat failed: {msg}")
 
 
 # =========================
