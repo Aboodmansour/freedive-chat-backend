@@ -41,7 +41,7 @@ OPENAI_CHAT_MODEL = os.getenv("OPENAI_CHAT_MODEL", "gpt-4o-mini").strip()
 # set OPENAI_EMBED_MODEL to a model your key/project can access (e.g. text-embedding-3-large).
 OPENAI_EMBED_MODEL = os.getenv("OPENAI_EMBED_MODEL", "text-embedding-ada-002").strip()
 
-# CORS
+# CORSs
 ALLOWED_ORIGINS = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "").split(",") if o.strip()]
 if not ALLOWED_ORIGINS:
     ALLOWED_ORIGINS = ["http://localhost:5500", "http://localhost:3000"]
