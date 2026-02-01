@@ -4,6 +4,7 @@ import os
 import time
 import json
 import math
+import re
 import sqlite3
 import secrets
 import asyncio
@@ -41,6 +42,11 @@ OPENAI_EMBED_MODEL = os.getenv("OPENAI_EMBED_MODEL", "text-embedding-3-small").s
 SITE_SITEMAP_URL = os.getenv("SITE_SITEMAP_URL", "").strip()
 SITE_BASE_URL = os.getenv("SITE_BASE_URL", "").strip()
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").strip()
+CONTACT_FORM_URL = os.getenv("CONTACT_FORM_URL", "").strip()
+CONTACT_FORM_URL_EN = os.getenv("CONTACT_FORM_URL_EN", "https://www.aboodfreediver.com/form1.php").strip()
+CONTACT_FORM_URL_DE = os.getenv("CONTACT_FORM_URL_DE", "https://www.aboodfreediver.com/form1de.php").strip()
+CONTACT_FORM_URL_AR = os.getenv("CONTACT_FORM_URL_AR", "https://www.aboodfreediver.com/form1ar.php").strip()
+CONTACT_FORM_PATH = os.getenv("CONTACT_FORM_PATH", "/form1-contact").strip()
 
 DB_PATH = os.getenv("DB_PATH", "data.sqlite3")
 
@@ -454,7 +460,99 @@ def get_booking(booking_id: int) -> Dict[str, Any]:
     conn.close()
     if not row:
         raise HTTPException(status_code=404, detail="Booking not found")
-    return dict(row)
+    return di
+def get_latest_booking_for_session(session_id: str) -> Optional[Dict[str, Any]]:
+    conn = db()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT * FROM booking_requests WHERE session_id=? ORDER BY created_at DESC, id DESC LIMIT 1",
+        (session_id,),
+    )
+    row = cur.fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def detect_language_from_text(text: str) -> str:
+    """Return 'ar', 'de', or 'en' based on simple heuristics."""
+    t = (text or "").strip()
+    if not t:
+        return "en"
+
+    # Arabic unicode ranges
+    if re.search(r"[\u0590-\u05FF\u0600-\u06FF\u0700-\u08FF\uFB50-\uFDFF\uFE70-\uFEFF]", t):
+        return "ar"
+
+    # German hints (umlauts / ß / common words)
+    if re.search(r"[äöüÄÖÜß]", t):
+        return "de"
+    lowered = t.lower()
+    german_words = [
+        "guten", "hallo", "bitte", "danke", "ich", "du", "sie", "wir", "und",
+        "möchte", "moechte", "kann", "können", "koennen", "zeit", "datum",
+        "uhr", "preis", "kurs", "training"
+    ]
+    if any(re.search(rf"\b{re.escape(w)}\b", lowered) for w in german_words):
+        return "de"
+
+    return "en"
+
+
+def detect_language(req_question: str, history: Optional[List[Dict[str, Any]]] = None) -> str:
+    """Detect language from current question + recent user history."""
+    # Prefer current question
+    lang = detect_language_from_text(req_question)
+    if lang != "en":
+        return lang
+
+    # Check last few user messages
+    for m in reversed(history or []):
+        if (m or {}).get("role") in ("user", "human"):
+            lang2 = detect_language_from_text((m or {}).get("content") or (m or {}).get("text") or "")
+            if lang2 != "en":
+                return lang2
+
+    return "en"
+
+
+def build_contact_form_url(page_url: str = "", lang: str = "en") -> str:
+    """Return the correct contact form URL.
+
+    Priority:
+      1) CONTACT_FORM_URL (single override)
+      2) Language-specific URLs (CONTACT_FORM_URL_EN/DE/AR)
+      3) SITE_BASE_URL + CONTACT_FORM_PATH (fallback)
+      4) Derive origin from page_url + CONTACT_FORM_PATH
+      5) CONTACT_FORM_PATH
+    """
+    # 1) Single override
+    if CONTACT_FORM_URL:
+        return CONTACT_FORM_URL
+
+    # 2) Language-specific
+    if (lang or "").lower().startswith("ar"):
+        return CONTACT_FORM_URL_AR
+    if (lang or "").lower().startswith("de"):
+        return CONTACT_FORM_URL_DE
+
+    # default English
+    if CONTACT_FORM_URL_EN:
+        return CONTACT_FORM_URL_EN
+
+    # 3/4/5) Backward compatible fallback
+    if SITE_BASE_URL:
+        return SITE_BASE_URL.rstrip("/") + "/" + CONTACT_FORM_PATH.lstrip("/")
+
+    # Fallback: try deriving from page_url origin
+    if page_url:
+        m = re.match(r"^(https?://[^/]+)", page_url.strip())
+        if m:
+            return m.group(1).rstrip("/") + "/" + CONTACT_FORM_PATH.lstrip("/")
+    return CONTACT_FORM_PATH
+
+
+
+ct(row)
 
 
 def make_approval_links(base_url: str, booking_id: int) -> Tuple[str, str]:
@@ -494,6 +592,7 @@ class ChatResponse(BaseModel):
     answer: str
     needs_human: bool = False
     booking_pending: bool = False
+    booking_next_url: Optional[str] = None
     sources: Optional[List[Dict[str, str]]] = None  # you can ignore on frontend
 
 
@@ -555,7 +654,61 @@ async def chat(req: ChatRequest):
             sources=[],
         )
 
-    # Booking request -> email notify + pending
+    
+    # If there is an existing booking for this session, reuse its status instead of creating duplicates.
+    latest_booking = get_latest_booking_for_session(req.session_id)
+    if latest_booking:
+        status = (latest_booking.get("status") or "").lower()
+        details = {}
+        try:
+            details = json.loads(latest_booking.get("details_json") or "{}")
+        except Exception:
+            details = {}
+
+        if status == "pending" and looks_like_booking(q):
+            return ChatResponse(
+                answer=(
+                    "Your booking request is still pending Abood’s approval. "
+                    "If you want to update anything (date/time, number of people, contact), "
+                    "tell us here and we will forward it."
+                ),
+                needs_human=True,
+                booking_pending=True,
+                booking_next_url=None,
+                sources=[],
+            )
+
+        if status == "approved":
+            lang = detect_language(q, req.history)
+            contact_url = build_contact_form_url(details.get("page_url", req.page_url or ""), lang=lang)
+            if looks_like_booking(q):
+                return ChatResponse(
+                    answer=(
+                        "Approved — please continue the booking on our contact form here: "
+                        f"{contact_url}\n\n"
+                        "After you submit the form, you can keep chatting here if you have questions."
+                    ),
+                    needs_human=False,
+                    booking_pending=False,
+                    booking_next_url=contact_url,
+                    sources=[],
+                )
+
+        if status == "denied":
+            if looks_like_booking(q):
+                return ChatResponse(
+                    answer=(
+                        "Sorry — we couldn’t approve that booking request. "
+                        "If you share alternative dates/times (and your experience level), we can check again. "
+                        "You can also ask any other questions here."
+                    ),
+                    needs_human=False,
+                    booking_pending=False,
+                    booking_next_url=None,
+                    sources=[],
+                )
+
+# Booking request -> email notify + pending
     if looks_like_booking(q):
         details = {"question": q, "page_url": req.page_url or "", "history": req.history or []}
         booking_id = create_booking_request(req.session_id, details)
@@ -592,6 +745,7 @@ async def chat(req: ChatRequest):
             ),
             needs_human=True,
             booking_pending=True,
+            booking_next_url=None,
             sources=[],
         )
 
@@ -658,11 +812,23 @@ def approve_booking(token: str = Query(...)):
     booking = get_booking(booking_id)
     update_booking_status(booking_id, "approved")
 
+    details = {}
+    try:
+        details = json.loads(booking.get("details_json") or "{}")
+    except Exception:
+        details = {}
+
+    lang = detect_language(details.get("question", ""), details.get("history") or [])
+
+    contact_url = build_contact_form_url(details.get("page_url", ""), lang=lang)
+
+    # This message is shown to the user via /chat/status polling
     add_human_message(
         booking["session_id"],
-        "Abood Freediver Team: Approved. Please share your full name and WhatsApp number to finalize the details.",
+        f"Approved ✅\nPlease continue the booking on our contact form: {contact_url}\nAfter you submit the form, you can keep chatting here if you have any questions.",
     )
     return {"ok": True, "status": "approved", "booking_id": booking_id}
+
 
 
 @app.get("/admin/booking/deny")
@@ -678,9 +844,10 @@ def deny_booking(token: str = Query(...)):
 
     add_human_message(
         booking["session_id"],
-        "Abood Freediver Team: Not approved yet. Please share alternative dates/times and your experience level.",
+        "Sorry — we can’t approve this booking request right now.\nIf you share alternative dates/times (and your experience level), we can check again.\nIf you have any other questions, you can ask here.",
     )
     return {"ok": True, "status": "denied", "booking_id": booking_id}
+
 
 
 @app.get("/admin/index/status")
