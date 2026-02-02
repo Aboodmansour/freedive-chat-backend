@@ -1103,47 +1103,21 @@ function esc(s){
 }
 
 /* -----------------------------
-   Draft persistence (FIX)
+   Draft persistence
 ----------------------------- */
 function draftKey(sessionId){ return "draft_reply_" + sessionId; }
-
 function saveDraft(sessionId, value){
   try { localStorage.setItem(draftKey(sessionId), value || ""); } catch(e){}
 }
-
 function loadDraft(sessionId){
   try { return localStorage.getItem(draftKey(sessionId)) || ""; } catch(e){ return ""; }
 }
-
 function clearDraft(sessionId){
   try { localStorage.removeItem(draftKey(sessionId)); } catch(e){}
 }
 
-// Capture drafts from existing textareas BEFORE we rebuild the table
-function captureDraftsFromDom(){
-  document.querySelectorAll("textarea.reply-box[data-session]").forEach((ta) => {
-    saveDraft(ta.dataset.session, ta.value || "");
-  });
-}
-
-// After we rebuild, restore drafts and attach listeners
-function wireDraftTextareas(){
-  document.querySelectorAll("textarea.reply-box[data-session]").forEach((ta) => {
-    const sid = ta.dataset.session;
-
-    // Restore only if empty (do not overwrite live typing)
-    if(!ta.value){
-      const d = loadDraft(sid);
-      if(d) ta.value = d;
-    }
-
-    // Save while typing
-    ta.addEventListener("input", () => saveDraft(sid, ta.value || ""));
-  });
-}
-
 /* -----------------------------
-   Data loading
+   Bookings (unchanged)
 ----------------------------- */
 async function loadBookings(){
   const data = await apiGet("/admin/api/bookings?status=pending");
@@ -1166,7 +1140,6 @@ async function loadBookings(){
     tb.appendChild(tr);
   });
 }
-
 async function approveBooking(id){
   await apiPost(`/admin/api/bookings/${id}/approve`, {});
   await loadBookings();
@@ -1176,67 +1149,152 @@ async function denyBooking(id){
   await loadBookings();
 }
 
-async function loadSupport(){
-  // IMPORTANT: save drafts before rebuilding table
-  captureDraftsFromDom();
+/* -----------------------------
+   Support table: PATCH updates (no rerender)
+----------------------------- */
+function getSupportTbody(){
+  return document.querySelector("#supportTbl tbody");
+}
 
-  const data = await apiGet("/admin/api/support?status=open");
-  const tb = document.querySelector("#supportTbl tbody");
-  tb.innerHTML = "";
+function getRow(sessionId){
+  return document.querySelector(`#supportTbl tbody tr[data-session="${CSS.escape(sessionId)}"]`);
+}
 
-  (data.items || []).forEach(it => {
-    const page = it.page_url || "";
-    const sid = it.session_id || "";
-    const sidEsc = esc(sid);
+function currentFocusInfo(){
+  const ae = document.activeElement;
+  if(!ae) return null;
+  if(ae.tagName !== "TEXTAREA") return null;
+  const sid = ae.getAttribute("data-session");
+  if(!sid) return null;
+  return {
+    sessionId: sid,
+    selectionStart: ae.selectionStart,
+    selectionEnd: ae.selectionEnd
+  };
+}
 
-    const tr = document.createElement("tr");
+function restoreFocus(info){
+  if(!info) return;
+  const ta = document.querySelector(`textarea.reply-box[data-session="${CSS.escape(info.sessionId)}"]`);
+  if(!ta) return;
+  ta.focus();
+  try{
+    ta.setSelectionRange(info.selectionStart, info.selectionEnd);
+  }catch(_){}
+}
+
+function ensureRow(it){
+  const tb = getSupportTbody();
+  const sid = it.session_id || "";
+  let tr = getRow(sid);
+
+  if(!tr){
+    tr = document.createElement("tr");
+    tr.setAttribute("data-session", sid);
+
     tr.innerHTML = `
-      <td>${sidEsc}</td>
-      <td>${esc(it.user_message)}</td>
-      <td>${page ? `<a target="_blank" rel="noopener noreferrer" href="${esc(page)}">${esc(page)}</a>` : ""}</td>
-      <td>${fmtTs(it.updated_at)}</td>
-      <td><button type="button" onclick="openConversation('${sidEsc}')">View</button></td>
-      <td>
-        <textarea
-          class="reply-box"
-          data-session="${sidEsc}"
-          placeholder="Type your reply..."
-          id="msg_${sidEsc}"
-        ></textarea>
-        <div style="margin-top:6px;">
-          <button type="button" onclick="sendReply('${sidEsc}', false)">Send</button>
-          <button type="button" onclick="sendReply('${sidEsc}', true)">Send &amp; Close</button>
-          <span class="small" id="status_${sidEsc}"></span>
-        </div>
-      </td>
+      <td class="col-session"></td>
+      <td class="col-msg"></td>
+      <td class="col-page"></td>
+      <td class="col-updated"></td>
+      <td class="col-conv"></td>
+      <td class="col-reply"></td>
     `;
     tb.appendChild(tr);
+
+    // Build reply cell once (so textarea node persists forever unless row removed)
+    const replyTd = tr.querySelector(".col-reply");
+    replyTd.innerHTML = `
+      <textarea
+        class="reply-box"
+        data-session="${esc(sid)}"
+        placeholder="Type your reply..."
+        id="msg_${esc(sid)}"
+      ></textarea>
+      <div style="margin-top:6px;">
+        <button type="button" class="btn-send">Send</button>
+        <button type="button" class="btn-send-close">Send &amp; Close</button>
+        <span class="small" id="status_${esc(sid)}"></span>
+      </div>
+    `;
+
+    // Wire textarea draft saving
+    const ta = replyTd.querySelector("textarea.reply-box");
+    const draft = loadDraft(sid);
+    if(draft) ta.value = draft;
+
+    ta.addEventListener("input", () => saveDraft(sid, ta.value || ""));
+
+    // Wire buttons
+    replyTd.querySelector(".btn-send").addEventListener("click", () => sendReply(sid, false));
+    replyTd.querySelector(".btn-send-close").addEventListener("click", () => sendReply(sid, true));
+
+    // Conversation button
+    tr.querySelector(".col-conv").innerHTML = `<button type="button" class="btn-view">View</button>`;
+    tr.querySelector(".btn-view").addEventListener("click", () => openConversation(sid));
+  }
+
+  // Update non-input columns safely (no replacing textarea)
+  tr.querySelector(".col-session").textContent = sid;
+  tr.querySelector(".col-msg").textContent = it.user_message || "";
+
+  const page = it.page_url || "";
+  tr.querySelector(".col-page").innerHTML = page
+    ? `<a target="_blank" rel="noopener noreferrer" href="${esc(page)}">${esc(page)}</a>`
+    : "";
+
+  tr.querySelector(".col-updated").textContent = fmtTs(it.updated_at);
+
+  return tr;
+}
+
+async function loadSupport(){
+  const focusInfo = currentFocusInfo(); // capture focus/cursor before updates
+
+  const data = await apiGet("/admin/api/support?status=open");
+  const items = (data.items || []);
+  const seen = new Set();
+
+  // Upsert rows
+  items.forEach(it => {
+    if(!it || !it.session_id) return;
+    seen.add(it.session_id);
+    ensureRow(it);
   });
 
-  // Restore drafts + attach input listeners after table is rendered
-  wireDraftTextareas();
+  // Remove rows that are no longer present
+  const tb = getSupportTbody();
+  Array.from(tb.querySelectorAll("tr[data-session]")).forEach(tr => {
+    const sid = tr.getAttribute("data-session");
+    if(sid && !seen.has(sid)){
+      // save draft before removing just in case
+      const ta = tr.querySelector("textarea.reply-box");
+      if(ta) saveDraft(sid, ta.value || "");
+      tr.remove();
+    }
+  });
+
+  restoreFocus(focusInfo); // restore focus/cursor after patch
 }
 
 async function sendReply(sessionId, closeIt){
   const el = document.getElementById("msg_" + sessionId);
   const statusEl = document.getElementById("status_" + sessionId);
+  const td = el ? el.closest("td") : null;
 
   const text = (el && el.value || "").trim();
   if(!text){ alert("Write a message first"); return; }
 
-  // UI lock for this row to avoid double send
-  const td = el ? el.closest("td") : null;
   if(td) td.classList.add("sending");
   if(statusEl) statusEl.textContent = "Sending...";
 
   try{
     await apiPost("/admin/api/support/message", {session_id: sessionId, text, close: closeIt});
 
-    // Clear draft ONLY after successful send
     clearDraft(sessionId);
-
     if(el) el.value = "";
     if(statusEl) statusEl.textContent = closeIt ? "Sent & closed." : "Sent.";
+
     await loadSupport();
   }catch(err){
     if(statusEl) statusEl.textContent = "Error sending.";
@@ -1246,6 +1304,9 @@ async function sendReply(sessionId, closeIt){
   }
 }
 
+/* -----------------------------
+   Modal conversation (unchanged)
+----------------------------- */
 function closeModal(){
   document.getElementById("backdrop").style.display = "none";
   document.getElementById("convBody").innerHTML = "";
@@ -1272,17 +1333,18 @@ async function openConversation(sessionId){
   document.getElementById("backdrop").style.display = "flex";
 }
 
+/* -----------------------------
+   Init
+----------------------------- */
 (async function init(){
   await loadBookings();
   await loadSupport();
 
-  // periodic refresh WITHOUT losing drafts
   setInterval(async ()=>{
     try{
       await loadBookings();
       await loadSupport();
     }catch(e){
-      // ignore transient errors
       console.error(e);
     }
   }, 5000);
