@@ -8,6 +8,7 @@ venv/
 
 # Environment variables
 .env
+*.zip
 
 # Local database
 data.sqlite3
@@ -15,3 +16,8 @@ data.sqlite3
 # OS / Editor junk
 .DS_Store
 .vscode/
+
+*.jpg
+*.jpeg
+*.png
+*.webp
