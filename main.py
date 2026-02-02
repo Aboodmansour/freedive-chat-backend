@@ -70,12 +70,14 @@ ADMIN_USER = os.getenv("ADMIN_USER", "").strip()
 ADMIN_PASS = os.getenv("ADMIN_PASS", "").strip()
 security = HTTPBasic()
 
+
 def require_admin(creds: HTTPBasicCredentials):
     if not (ADMIN_USER and ADMIN_PASS):
         raise HTTPException(status_code=500, detail="ADMIN_USER/ADMIN_PASS not set")
     ok = secrets.compare_digest(creds.username, ADMIN_USER) and secrets.compare_digest(creds.password, ADMIN_PASS)
     if not ok:
         raise HTTPException(status_code=401, detail="Unauthorized", headers={"WWW-Authenticate": "Basic"})
+
 
 # Approval token for email links
 ADMIN_TOKEN_SECRET = os.getenv("ADMIN_TOKEN_SECRET", "").strip() or ("CHANGE_ME_" + secrets.token_urlsafe(16))
@@ -86,7 +88,6 @@ if not OPENAI_API_KEY:
     raise RuntimeError("OPENAI_API_KEY is not set")
 openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
 
-
 # =========================
 # Database
 # =========================
@@ -96,9 +97,16 @@ def db() -> sqlite3.Connection:
     return conn
 
 
+def _column_exists(cur: sqlite3.Cursor, table: str, col: str) -> bool:
+    cur.execute(f"PRAGMA table_info({table})")
+    cols = [r["name"] for r in cur.fetchall()]
+    return col in cols
+
+
 def init_db():
     conn = db()
     cur = conn.cursor()
+
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS chunks (
@@ -140,7 +148,8 @@ def init_db():
         )
         """
     )
-    # Human-help tickets (admin dashboard)
+
+    # Human-help tickets (admin dashboard) - include reason
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS support_requests (
@@ -149,11 +158,20 @@ def init_db():
             status TEXT NOT NULL, -- open|closed
             user_message TEXT NOT NULL,
             page_url TEXT,
+            reason TEXT, -- booking|human|payment|other
             created_at INTEGER NOT NULL,
             updated_at INTEGER NOT NULL
         )
         """
     )
+    # Migrate older DBs that created support_requests without "reason"
+    try:
+        if not _column_exists(cur, "support_requests", "reason"):
+            cur.execute("ALTER TABLE support_requests ADD COLUMN reason TEXT")
+    except Exception:
+        # If ALTER TABLE fails for any reason, ignore (Render sometimes has locks), app still works without reason.
+        pass
+
     # Session takeover state
     cur.execute(
         """
@@ -164,6 +182,7 @@ def init_db():
         )
         """
     )
+
     # Conversation log (FULL chat history per session)
     cur.execute(
         """
@@ -177,6 +196,7 @@ def init_db():
         """
     )
     cur.execute("CREATE INDEX IF NOT EXISTS idx_conv_session_ts ON conversation_log(session_id, ts, id)")
+
     conn.commit()
     conn.close()
 
@@ -299,23 +319,85 @@ _NEW_BOOKING_PATTERNS = [
     r"حجز جديد", r"حجز آخر", r"احجز مرة أخرى", r"أحجز مرة أخرى", r"حجز مرة أخرى", r"حجز ثاني",
 ]
 
+# =========================
+# Payment triggers (MULTILINGUAL)
+# =========================
+_PAYMENT_PATTERNS = [
+    # EN
+    r"\bpayment\b",
+    r"\bpay\b",
+    r"\bpaying\b",
+    r"\bprice\b",
+    r"\bcard\b",
+    r"\bcredit\s*card\b",
+    r"\bdebit\s*card\b",
+    r"\bvisa\b",
+    r"\bmastercard\b",
+    r"\bapple\s*pay\b",
+    r"\bgoogle\s*pay\b",
+    r"\bcash\b",
+    r"\bbank\s*transfer\b",
+    r"\bwire\b",
+
+    # DE
+    r"\bzahlung\b",
+    r"\bbezahlung\b",
+    r"\bbezahlen\b",
+    r"\bpreis\b",
+    r"\bkarte\b",
+    r"\bkredit\s*karte\b",
+    r"\bdebit\s*karte\b",
+    r"\bvisa\b",
+    r"\bmastercard\b",
+    r"\bbar\b",
+    r"\bbargeld\b",
+    r"\büberweisung\b",
+    r"\bueberweisung\b",
+    r"\bbank\s*überweisung\b",
+    r"\bbank\s*ueberweisung\b",
+
+    # AR
+    r"دفع",
+    r"الدفع",
+    r"طريقة\s*الدفع",
+    r"طرق\s*الدفع",
+    r"بطاقة",
+    r"كرت",
+    r"فيزا",
+    r"ماستر",
+    r"ماستر\s*كارد",
+    r"كاش",
+    r"نقد",
+    r"تحويل\s*بنكي",
+]
+
+
+def looks_like_payment(q: str) -> bool:
+    text = (q or "")
+    return any(re.search(p, text, flags=re.IGNORECASE) for p in _PAYMENT_PATTERNS)
+
+
 def looks_like_booking(q: str) -> bool:
     text = q or ""
     return any(re.search(p, text, flags=re.IGNORECASE) for p in _BOOKING_PATTERNS)
 
+
 def wants_new_booking(q: str) -> bool:
     text = q or ""
     return any(re.search(p, text, flags=re.IGNORECASE) for p in _NEW_BOOKING_PATTERNS)
+
 
 def wants_human(q: str) -> bool:
     ql = (q or "").lower()
     triggers = ["human", "real person", "abood", "instructor", "call me", "contact", "whatsapp", "agent"]
     return any(t in ql for t in triggers)
 
+
 def is_medical_or_high_risk(q: str) -> bool:
     ql = (q or "").lower()
     triggers = ["faint", "blackout", "lung", "pain", "injury", "blood", "doctor", "medical", "pregnan", "asthma"]
     return any(t in ql for t in triggers)
+
 
 def can_send_booking_email() -> bool:
     return bool(OWNER_NOTIFY_EMAIL and SENDGRID_API_KEY)
@@ -335,6 +417,7 @@ def log_message(session_id: str, role: str, text: str):
     )
     conn.commit()
     conn.close()
+
 
 def get_conversation(session_id: str, limit: int = 300) -> List[Dict[str, Any]]:
     conn = db()
@@ -362,6 +445,7 @@ def set_human_mode(session_id: str, human_mode: bool):
     conn.commit()
     conn.close()
 
+
 def is_human_mode(session_id: str) -> bool:
     conn = db()
     cur = conn.cursor()
@@ -370,7 +454,8 @@ def is_human_mode(session_id: str) -> bool:
     conn.close()
     return bool(row and int(row["human_mode"]) == 1)
 
-def upsert_support_request(session_id: str, user_message: str, page_url: str):
+
+def upsert_support_request(session_id: str, user_message: str, page_url: str, reason: str = "other"):
     conn = db()
     cur = conn.cursor()
     ts = now_ts()
@@ -380,17 +465,19 @@ def upsert_support_request(session_id: str, user_message: str, page_url: str):
     )
     row = cur.fetchone()
     if row:
+        # keep the most recent reason if provided
         cur.execute(
-            "UPDATE support_requests SET user_message=?, page_url=?, updated_at=? WHERE id=?",
-            (user_message, page_url or "", ts, int(row["id"])),
+            "UPDATE support_requests SET user_message=?, page_url=?, reason=?, updated_at=? WHERE id=?",
+            (user_message, page_url or "", reason, ts, int(row["id"])),
         )
     else:
         cur.execute(
-            "INSERT INTO support_requests(session_id,status,user_message,page_url,created_at,updated_at) VALUES(?,?,?,?,?,?)",
-            (session_id, "open", user_message, page_url or "", ts, ts),
+            "INSERT INTO support_requests(session_id,status,user_message,page_url,reason,created_at,updated_at) VALUES(?,?,?,?,?,?,?)",
+            (session_id, "open", user_message, page_url or "", reason, ts, ts),
         )
     conn.commit()
     conn.close()
+
 
 def close_support_request(session_id: str):
     conn = db()
@@ -403,6 +490,7 @@ def close_support_request(session_id: str):
     conn.commit()
     conn.close()
 
+
 def list_support_requests(status: str = "open") -> List[Dict[str, Any]]:
     conn = db()
     cur = conn.cursor()
@@ -413,6 +501,7 @@ def list_support_requests(status: str = "open") -> List[Dict[str, Any]]:
     rows = cur.fetchall()
     conn.close()
     return [dict(r) for r in rows]
+
 
 def list_booking_requests(status: str = "pending") -> List[Dict[str, Any]]:
     conn = db()
@@ -438,6 +527,7 @@ async def embed_text(text: str) -> List[float]:
         return list(resp.data[0].embedding)
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"OpenAI embeddings failed: {str(e)}")
+
 
 async def generate_answer(system: str, user: str) -> str:
     try:
@@ -519,6 +609,7 @@ def parse_sitemap_urls(xml_text: str, site_base_url: str) -> List[str]:
             break
     return urls
 
+
 async def build_index():
     if not SITE_SITEMAP_URL:
         print("SITE_SITEMAP_URL not set; skipping indexing.")
@@ -562,6 +653,7 @@ async def build_index():
     conn.close()
     print("Index build complete.")
 
+
 async def retrieve_site_context(question: str) -> Tuple[List[Dict[str, Any]], float]:
     if chunks_count() == 0:
         return [], 0.0
@@ -603,12 +695,14 @@ def ensure_session(session_id: str):
     conn.commit()
     conn.close()
 
+
 def add_human_message(session_id: str, text: str):
     conn = db()
     cur = conn.cursor()
     cur.execute("INSERT INTO human_messages(session_id, text, ts) VALUES(?,?,?)", (session_id, text, now_ts()))
     conn.commit()
     conn.close()
+
 
 def get_human_messages(session_id: str) -> List[Dict[str, Any]]:
     conn = db()
@@ -635,12 +729,14 @@ def create_booking_request(session_id: str, details: Dict[str, Any]) -> int:
     conn.close()
     return int(booking_id)
 
+
 def update_booking_status(booking_id: int, status: str):
     conn = db()
     cur = conn.cursor()
     cur.execute("UPDATE booking_requests SET status=?, updated_at=? WHERE id=?", (status, now_ts(), booking_id))
     conn.commit()
     conn.close()
+
 
 def get_booking(booking_id: int) -> Dict[str, Any]:
     conn = db()
@@ -652,6 +748,7 @@ def get_booking(booking_id: int) -> Dict[str, Any]:
         raise HTTPException(status_code=404, detail="Booking not found")
     return dict(row)
 
+
 def get_latest_booking_for_session(session_id: str) -> Optional[Dict[str, Any]]:
     conn = db()
     cur = conn.cursor()
@@ -662,6 +759,7 @@ def get_latest_booking_for_session(session_id: str) -> Optional[Dict[str, Any]]:
     row = cur.fetchone()
     conn.close()
     return dict(row) if row else None
+
 
 def build_contact_form_url(page_url: str = "", lang: str = "en") -> str:
     if CONTACT_FORM_URL:
@@ -679,6 +777,7 @@ def build_contact_form_url(page_url: str = "", lang: str = "en") -> str:
         if m:
             return m.group(1).rstrip("/") + "/" + CONTACT_FORM_PATH.lstrip("/")
     return CONTACT_FORM_PATH
+
 
 def make_approval_links(base_url: str, booking_id: int) -> Tuple[str, str]:
     token = serializer.dumps({"booking_id": booking_id})
@@ -711,6 +810,7 @@ class ChatRequest(BaseModel):
     history: Optional[List[Dict[str, Any]]] = None
     page_url: Optional[str] = None
 
+
 class ChatResponse(BaseModel):
     answer: str
     needs_human: bool = False
@@ -718,10 +818,12 @@ class ChatResponse(BaseModel):
     booking_next_url: Optional[str] = None
     sources: Optional[List[Dict[str, str]]] = None
 
+
 class AdminMessageRequest(BaseModel):
     session_id: str
     text: str
     close: bool = False
+
 
 index_task = None
 
@@ -755,7 +857,7 @@ async def chat(req: ChatRequest):
 
     # If this session is in takeover mode, never answer with AI.
     if is_human_mode(req.session_id):
-        upsert_support_request(req.session_id, q, req.page_url or "")
+        upsert_support_request(req.session_id, q, req.page_url or "", reason="human")
 
         if can_send_booking_email():
             try:
@@ -779,7 +881,7 @@ async def chat(req: ChatRequest):
     # Human takeover / safety triggers
     if is_medical_or_high_risk(q) or wants_human(q):
         set_human_mode(req.session_id, True)
-        upsert_support_request(req.session_id, q, req.page_url or "")
+        upsert_support_request(req.session_id, q, req.page_url or "", reason="human")
 
         if can_send_booking_email():
             try:
@@ -800,6 +902,37 @@ async def chat(req: ChatRequest):
             "Thanks — this is the Abood Freediver team. "
             "For safety and accuracy, Abood will reply directly here. "
             "Please share your name and preferred contact (WhatsApp or email)."
+        )
+        log_message(req.session_id, "assistant", answer)
+        return ChatResponse(answer=answer, needs_human=True, booking_pending=False, booking_next_url=None, sources=[])
+
+    # Payment questions -> force takeover + notify admin
+    if looks_like_payment(q):
+        set_human_mode(req.session_id, True)
+        upsert_support_request(req.session_id, q, req.page_url or "", reason="payment")
+
+        if can_send_booking_email():
+            try:
+                send_email(
+                    OWNER_NOTIFY_EMAIL,
+                    "Abood Freediver: Payment question (needs human reply)",
+                    f"""
+                    <h3>Payment question (human reply needed)</h3>
+                    <p><b>Session:</b> {req.session_id}</p>
+                    <p><b>Page:</b> {req.page_url or ''}</p>
+                    <p><b>User message:</b> {q}</p>
+                    <p>Open the admin dashboard to reply.</p>
+                    """,
+                )
+            except Exception as e:
+                print("Email payment notify failed:", str(e))
+
+        answer = (
+            "Thanks — for payment details, a team member will reply to you directly here.\n\n"
+            "Please share:\n"
+            "1) Which course/session you want\n"
+            "2) When you plan to come\n"
+            "3) Your preferred payment method (cash / card / transfer)\n"
         )
         log_message(req.session_id, "assistant", answer)
         return ChatResponse(answer=answer, needs_human=True, booking_pending=False, booking_next_url=None, sources=[])
@@ -987,11 +1120,12 @@ def approve_booking(token: str = Query(...)):
     lang = detect_language(details.get("question", ""), details.get("history") or [])
     contact_url = build_contact_form_url(details.get("page_url", ""), lang=lang)
 
-    add_human_message(
-        booking["session_id"],
-        f"Approved ✅\nPlease continue the booking on our contact form: {contact_url}\nAfter you submit the form, you can keep chatting here if you have any questions.",
+    msg = (
+        f"Approved ✅\nPlease continue the booking on our contact form: {contact_url}\n"
+        "After you submit the form, you can keep chatting here if you have any questions."
     )
-    log_message(booking["session_id"], "human", f"Approved ✅ link shared: {contact_url}")
+    add_human_message(booking["session_id"], msg)
+    log_message(booking["session_id"], "human", msg)
     return {"ok": True, "status": "approved", "booking_id": booking_id}
 
 
@@ -1006,11 +1140,13 @@ def deny_booking(token: str = Query(...)):
     booking = get_booking(booking_id)
     update_booking_status(booking_id, "denied")
 
-    add_human_message(
-        booking["session_id"],
-        "Sorry — we can’t approve this booking request right now.\nIf you share alternative dates/times (and your experience level), we can check again.\nIf you have any other questions, you can ask here.",
+    msg = (
+        "Sorry — we can’t approve this booking request right now.\n"
+        "If you share alternative dates/times (and your experience level), we can check again.\n"
+        "If you have any other questions, you can ask here."
     )
-    log_message(booking["session_id"], "human", "Denied booking request (email-token).")
+    add_human_message(booking["session_id"], msg)
+    log_message(booking["session_id"], "human", msg)
     return {"ok": True, "status": "denied", "booking_id": booking_id}
 
 
@@ -1118,8 +1254,6 @@ function clearDraft(sessionId){
 
 /* -----------------------------
    Auto-refresh pause while typing
-   - pauses refresh on any textarea input/focus
-   - resumes after 10s of inactivity
 ----------------------------- */
 let refreshPausedUntil = 0;
 let refreshResumeTimer = null;
@@ -1129,19 +1263,17 @@ function pauseRefreshForTyping(){
   refreshPausedUntil = Date.now() + REFRESH_RESUME_MS;
   if(refreshResumeTimer) clearTimeout(refreshResumeTimer);
   refreshResumeTimer = setTimeout(() => {
-    // Only truly resume if no new typing occurred since scheduling
     if(Date.now() >= refreshPausedUntil){
       refreshPausedUntil = 0;
     }
   }, REFRESH_RESUME_MS + 50);
 }
-
 function isRefreshPaused(){
   return Date.now() < refreshPausedUntil;
 }
 
 /* -----------------------------
-   Bookings (unchanged)
+   Bookings
 ----------------------------- */
 async function loadBookings(){
   const data = await apiGet("/admin/api/bookings?status=pending");
@@ -1174,7 +1306,7 @@ async function denyBooking(id){
 }
 
 /* -----------------------------
-   Support table: PATCH updates (no rerender)
+   Support: PATCH updates (no rerender)
 ----------------------------- */
 function getSupportTbody(){
   return document.querySelector("#supportTbl tbody");
@@ -1202,78 +1334,7 @@ function restoreFocus(info){
   try{ ta.setSelectionRange(info.selectionStart, info.selectionEnd); }catch(_){}
 }
 
-function ensureRow(it){
-  const tb = getSupportTbody();
-  const sid = it.session_id || "";
-  let tr = getRow(sid);
-
-  if(!tr){
-    tr = document.createElement("tr");
-    tr.setAttribute("data-session", sid);
-
-    tr.innerHTML = `
-      <td class="col-session"></td>
-      <td class="col-msg"></td>
-      <td class="col-page"></td>
-      <td class="col-updated"></td>
-      <td class="col-conv"></td>
-      <td class="col-reply"></td>
-    `;
-    tb.appendChild(tr);
-
-    // Reply cell (created once; preserved)
-    const replyTd = tr.querySelector(".col-reply");
-    replyTd.innerHTML = `
-      <textarea
-        class="reply-box"
-        data-session="${esc(sid)}"
-        placeholder="Type your reply..."
-        id="msg_${esc(sid)}"
-      ></textarea>
-      <div style="margin-top:6px;">
-        <button type="button" class="btn-send">Send</button>
-        <button type="button" class="btn-send-close">Send &amp; Close</button>
-        <span class="small" id="status_${esc(sid)}"></span>
-      </div>
-    `;
-
-    const ta = replyTd.querySelector("textarea.reply-box");
-    const draft = loadDraft(sid);
-    if(draft) ta.value = draft;
-
-    // Pause refresh while typing / focusing
-    ta.addEventListener("focus", pauseRefreshForTyping);
-    ta.addEventListener("keydown", pauseRefreshForTyping);
-    ta.addEventListener("input", () => {
-      pauseRefreshForTyping();
-      saveDraft(sid, ta.value || "");
-    });
-
-    // Buttons
-    replyTd.querySelector(".btn-send").addEventListener("click", () => sendReply(sid, false));
-    replyTd.querySelector(".btn-send-close").addEventListener("click", () => sendReply(sid, true));
-
-    // Conversation button
-    tr.querySelector(".col-conv").innerHTML = `<button type="button" class="btn-view">View</button>`;
-    tr.querySelector(".btn-view").addEventListener("click", () => openConversation(sid));
-  }
-
-  // Update non-input columns (safe)
-  tr.querySelector(".col-session").textContent = sid;
-  tr.querySelector(".col-msg").textContent = it.user_message || "";
-
-  const page = it.page_url || "";
-  tr.querySelector(".col-page").innerHTML = page
-    ? `<a target="_blank" rel="noopener noreferrer" href="${esc(page)}">${esc(page)}</a>`
-    : "";
-
-  tr.querySelector(".col-updated").textContent = fmtTs(it.updated_at);
-
-  return tr;
-}
-
 async function loadSupport(){
-  // If admin is typing, do not refresh
   if(isRefreshPaused()) return;
 
   const focusInfo = currentFocusInfo();
@@ -1285,11 +1346,67 @@ async function loadSupport(){
   items.forEach(it => {
     if(!it || !it.session_id) return;
     seen.add(it.session_id);
-    ensureRow(it);
+
+    let tr = getRow(it.session_id);
+    if(!tr){
+      tr = document.createElement("tr");
+      tr.setAttribute("data-session", it.session_id);
+
+      tr.innerHTML = `
+        <td class="col-session"></td>
+        <td class="col-msg"></td>
+        <td class="col-page"></td>
+        <td class="col-updated"></td>
+        <td class="col-conv"></td>
+        <td class="col-reply"></td>
+      `;
+
+      getSupportTbody().appendChild(tr);
+
+      tr.querySelector(".col-conv").innerHTML = `<button type="button" class="btn-view">View</button>`;
+      tr.querySelector(".btn-view").addEventListener("click", () => openConversation(it.session_id));
+
+      const replyTd = tr.querySelector(".col-reply");
+      // IMPORTANT: DO NOT HTML-escape session id for DOM ids.
+      const msgId = "msg_" + it.session_id;
+      const stId  = "status_" + it.session_id;
+
+      replyTd.innerHTML = `
+        <textarea class="reply-box" data-session="${esc(it.session_id)}" placeholder="Type your reply..." id="${msgId}"></textarea>
+        <div style="margin-top:6px;">
+          <button type="button" class="btn-send">Send</button>
+          <button type="button" class="btn-send-close">Send &amp; Close</button>
+          <span class="small" id="${stId}"></span>
+        </div>
+      `;
+
+      const ta = replyTd.querySelector("textarea.reply-box");
+      const draft = loadDraft(it.session_id);
+      if(draft) ta.value = draft;
+
+      ta.addEventListener("focus", pauseRefreshForTyping);
+      ta.addEventListener("keydown", pauseRefreshForTyping);
+      ta.addEventListener("input", () => {
+        pauseRefreshForTyping();
+        saveDraft(it.session_id, ta.value || "");
+      });
+
+      replyTd.querySelector(".btn-send").addEventListener("click", () => sendReply(it.session_id, false));
+      replyTd.querySelector(".btn-send-close").addEventListener("click", () => sendReply(it.session_id, true));
+    }
+
+    tr.querySelector(".col-session").textContent = it.session_id || "";
+    tr.querySelector(".col-msg").textContent = it.user_message || "";
+
+    const page = it.page_url || "";
+    tr.querySelector(".col-page").innerHTML = page
+      ? `<a target="_blank" rel="noopener noreferrer" href="${esc(page)}">${esc(page)}</a>`
+      : "";
+
+    tr.querySelector(".col-updated").textContent = fmtTs(it.updated_at);
   });
 
-  const tb = getSupportTbody();
-  Array.from(tb.querySelectorAll("tr[data-session]")).forEach(tr => {
+  Array.from(getSupportTbody().querySelectorAll("tr[data-session]")).forEach(tr => {
     const sid = tr.getAttribute("data-session");
     if(sid && !seen.has(sid)){
       const ta = tr.querySelector("textarea.reply-box");
@@ -1302,14 +1419,16 @@ async function loadSupport(){
 }
 
 async function sendReply(sessionId, closeIt){
-  const el = document.getElementById("msg_" + sessionId);
-  const statusEl = document.getElementById("status_" + sessionId);
+  const msgId = "msg_" + sessionId;
+  const stId  = "status_" + sessionId;
+
+  const el = document.getElementById(msgId);
+  const statusEl = document.getElementById(stId);
   const td = el ? el.closest("td") : null;
 
   const text = (el && el.value || "").trim();
   if(!text){ alert("Write a message first"); return; }
 
-  // Pause refresh while sending too
   pauseRefreshForTyping();
 
   if(td) td.classList.add("sending");
@@ -1317,12 +1436,10 @@ async function sendReply(sessionId, closeIt){
 
   try{
     await apiPost("/admin/api/support/message", {session_id: sessionId, text, close: closeIt});
-
     clearDraft(sessionId);
     if(el) el.value = "";
     if(statusEl) statusEl.textContent = closeIt ? "Sent & closed." : "Sent.";
 
-    // force a refresh after send (even if paused)
     refreshPausedUntil = 0;
     await loadSupport();
   }catch(err){
@@ -1334,7 +1451,7 @@ async function sendReply(sessionId, closeIt){
 }
 
 /* -----------------------------
-   Modal conversation (unchanged)
+   Modal conversation
 ----------------------------- */
 function closeModal(){
   document.getElementById("backdrop").style.display = "none";
@@ -1343,7 +1460,7 @@ function closeModal(){
 }
 
 async function openConversation(sessionId){
-  pauseRefreshForTyping(); // avoid refresh while reading modal
+  pauseRefreshForTyping();
 
   const data = await apiGet(`/admin/api/conversation?session_id=${encodeURIComponent(sessionId)}&limit=300`);
   document.getElementById("convTitle").textContent = sessionId;
@@ -1356,7 +1473,7 @@ async function openConversation(sessionId){
     div.className = "chatline " + (role || "assistant");
     div.innerHTML = `
       <div class="meta"><b>${esc(role)}</b> <span class="pill">${esc(fmtTs(m.ts))}</span></div>
-      <div>${esc(m.text || "").replace(/\\n/g, "<br>")}</div>
+      <div>${esc(m.text || "").replace(/\n/g, "<br>")}</div>
     `;
     body.appendChild(div);
   });
@@ -1367,8 +1484,6 @@ async function openConversation(sessionId){
 /* -----------------------------
    Init + polling
 ----------------------------- */
-let pollTimer = null;
-
 async function pollOnce(){
   try{
     await loadBookings();
@@ -1380,9 +1495,8 @@ async function pollOnce(){
 
 (async function init(){
   await pollOnce();
-  pollTimer = setInterval(pollOnce, 5000);
+  setInterval(pollOnce, 5000);
 
-  // Global listeners: if user clicks/focuses any textarea, pause refresh
   document.addEventListener("focusin", (e) => {
     if(e.target && e.target.tagName === "TEXTAREA") pauseRefreshForTyping();
   });
@@ -1418,7 +1532,10 @@ def admin_api_approve_booking(booking_id: int, creds: HTTPBasicCredentials = Dep
     lang = detect_language(details.get("question", ""), details.get("history") or [])
     contact_url = build_contact_form_url(details.get("page_url", ""), lang=lang)
 
-    msg = f"Approved ✅\nPlease continue the booking on our contact form: {contact_url}\nAfter you submit the form, you can keep chatting here if you have any questions."
+    msg = (
+        f"Approved ✅\nPlease continue the booking on our contact form: {contact_url}\n"
+        "After you submit the form, you can keep chatting here if you have any questions."
+    )
     add_human_message(booking["session_id"], msg)
     log_message(booking["session_id"], "human", msg)
     return {"ok": True}
@@ -1461,7 +1578,11 @@ def admin_api_support_message(req: AdminMessageRequest, creds: HTTPBasicCredenti
 
 
 @app.get("/admin/api/conversation")
-def admin_api_conversation(session_id: str = Query(...), limit: int = 300, creds: HTTPBasicCredentials = Depends(security)):
+def admin_api_conversation(
+    session_id: str = Query(...),
+    limit: int = 300,
+    creds: HTTPBasicCredentials = Depends(security),
+):
     require_admin(creds)
     return {"items": get_conversation(session_id, limit=limit)}
 
