@@ -11,8 +11,10 @@ import asyncio
 from typing import List, Dict, Any, Optional, Tuple
 
 import requests
-from fastapi import FastAPI, Query, HTTPException
+from fastapi import FastAPI, Query, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse
+from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from pydantic import BaseModel
 
 from bs4 import BeautifulSoup
@@ -42,6 +44,7 @@ OPENAI_EMBED_MODEL = os.getenv("OPENAI_EMBED_MODEL", "text-embedding-3-small").s
 SITE_SITEMAP_URL = os.getenv("SITE_SITEMAP_URL", "").strip()
 SITE_BASE_URL = os.getenv("SITE_BASE_URL", "").strip()
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").strip()
+
 CONTACT_FORM_URL = os.getenv("CONTACT_FORM_URL", "").strip()
 CONTACT_FORM_URL_EN = os.getenv("CONTACT_FORM_URL_EN", "https://www.aboodfreediver.com/form1.php").strip()
 CONTACT_FORM_URL_DE = os.getenv("CONTACT_FORM_URL_DE", "https://www.aboodfreediver.com/form1de.php").strip()
@@ -62,7 +65,19 @@ ALLOWED_ORIGINS = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "").split(","
 if not ALLOWED_ORIGINS:
     ALLOWED_ORIGINS = ["http://localhost:5500", "http://localhost:3000"]
 
-# Approval token
+# Admin Basic Auth (Render)
+ADMIN_USER = os.getenv("ADMIN_USER", "").strip()
+ADMIN_PASS = os.getenv("ADMIN_PASS", "").strip()
+security = HTTPBasic()
+
+def require_admin(creds: HTTPBasicCredentials):
+    if not (ADMIN_USER and ADMIN_PASS):
+        raise HTTPException(status_code=500, detail="ADMIN_USER/ADMIN_PASS not set")
+    ok = secrets.compare_digest(creds.username, ADMIN_USER) and secrets.compare_digest(creds.password, ADMIN_PASS)
+    if not ok:
+        raise HTTPException(status_code=401, detail="Unauthorized", headers={"WWW-Authenticate": "Basic"})
+
+# Approval token for email links
 ADMIN_TOKEN_SECRET = os.getenv("ADMIN_TOKEN_SECRET", "").strip() or ("CHANGE_ME_" + secrets.token_urlsafe(16))
 serializer = URLSafeSerializer(ADMIN_TOKEN_SECRET, salt="booking-approval")
 
@@ -70,6 +85,7 @@ serializer = URLSafeSerializer(ADMIN_TOKEN_SECRET, salt="booking-approval")
 if not OPENAI_API_KEY:
     raise RuntimeError("OPENAI_API_KEY is not set")
 openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
+
 
 # =========================
 # Database
@@ -124,6 +140,43 @@ def init_db():
         )
         """
     )
+    # Human-help tickets (admin dashboard)
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS support_requests (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT NOT NULL,
+            status TEXT NOT NULL, -- open|closed
+            user_message TEXT NOT NULL,
+            page_url TEXT,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL
+        )
+        """
+    )
+    # Session takeover state
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS session_state (
+            session_id TEXT PRIMARY KEY,
+            human_mode INTEGER NOT NULL, -- 0|1
+            updated_at INTEGER NOT NULL
+        )
+        """
+    )
+    # Conversation log (FULL chat history per session)
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS conversation_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT NOT NULL,
+            role TEXT NOT NULL,     -- user|assistant|human
+            text TEXT NOT NULL,
+            ts INTEGER NOT NULL
+        )
+        """
+    )
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_conv_session_ts ON conversation_log(session_id, ts, id)")
     conn.commit()
     conn.close()
 
@@ -135,6 +188,7 @@ def chunks_count() -> int:
     n = cur.fetchone()["n"]
     conn.close()
     return int(n)
+
 
 # =========================
 # Utilities
@@ -188,130 +242,188 @@ def chunk_text(text: str, chunk_chars: int, overlap: int) -> List[str]:
 
 
 def detect_language_from_text(text: str) -> str:
-    """Return 'ar', 'de', or 'en' based on simple heuristics."""
     t = (text or "").strip()
     if not t:
         return "en"
-
-    # Arabic unicode ranges
     if re.search(r"[\u0590-\u05FF\u0600-\u06FF\u0700-\u08FF\uFB50-\uFDFF\uFE70-\uFEFF]", t):
         return "ar"
-
-    # German hints (umlauts / ß / common words)
     if re.search(r"[äöüÄÖÜß]", t):
         return "de"
     lowered = t.lower()
     german_words = [
         "guten", "hallo", "bitte", "danke", "ich", "du", "sie", "wir", "und",
         "möchte", "moechte", "kann", "können", "koennen", "zeit", "datum",
-        "uhr", "preis", "kurs", "training"
+        "uhr", "kurs", "training"
     ]
     if any(re.search(rf"\b{re.escape(w)}\b", lowered) for w in german_words):
         return "de"
-
     return "en"
 
 
 def detect_language(req_question: str, history: Optional[List[Dict[str, Any]]] = None) -> str:
-    """Detect language from current question + recent user history."""
     lang = detect_language_from_text(req_question)
     if lang != "en":
         return lang
-
     for m in reversed(history or []):
         if (m or {}).get("role") in ("user", "human"):
             lang2 = detect_language_from_text((m or {}).get("content") or (m or {}).get("text") or "")
             if lang2 != "en":
                 return lang2
-
     return "en"
 
 
 # =========================
 # Booking triggers (MULTILINGUAL)
-# - Booking detection: ONLY reservation/booking words (EN/DE/AR)
-# - New booking detection: EN/DE/AR phrases
 # =========================
 _BOOKING_PATTERNS = [
     # EN
-    r"\bbook\b",
-    r"\bbooking\b",
-    r"\breserve\b",
-    r"\breservation\b",
-
+    r"\bbook\b", r"\bbooking\b", r"\breserve\b", r"\breservation\b",
     # DE
-    r"\bbuchen\b",
-    r"\bbuchung\b",
-    r"\breservieren\b",
-    r"\breservierung\b",
-
-    # AR (no word boundaries needed)
-    r"حجز",
-    r"احجز",
-    r"أحجز",
-    r"حجوزات",
-    r"حجز\s*موعد",
+    r"\bbuchen\b", r"\bbuchung\b", r"\breservieren\b", r"\breservierung\b",
+    # AR
+    r"حجز", r"احجز", r"أحجز", r"حجوزات", r"حجز\s*موعد",
 ]
 
 _NEW_BOOKING_PATTERNS = [
     # EN
-    r"\bbook again\b",
-    r"\bbooking again\b",
-    r"\bnew booking\b",
-    r"\banother booking\b",
-    r"\banother reservation\b",
-    r"\bmake another booking\b",
-    r"\bmake a new booking\b",
-    r"\bnew reservation\b",
-    r"\breserve again\b",
-    r"\breservation again\b",
-
+    r"\bbook again\b", r"\bbooking again\b", r"\bnew booking\b",
+    r"\banother booking\b", r"\banother reservation\b",
+    r"\bmake another booking\b", r"\bmake a new booking\b",
+    r"\bnew reservation\b", r"\breserve again\b", r"\breservation again\b",
     # DE
-    r"\bnochmal buchen\b",
-    r"\bnoch einmal buchen\b",
-    r"\bneue buchung\b",
-    r"\bweitere buchung\b",
-    r"\bnoch eine buchung\b",
-    r"\bneue reservierung\b",
-    r"\bweitere reservierung\b",
-    r"\bnoch eine reservierung\b",
-    r"\bnochmal reservieren\b",
-    r"\bnoch einmal reservieren\b",
-
+    r"\bnochmal buchen\b", r"\bnoch einmal buchen\b", r"\bneue buchung\b",
+    r"\bweitere buchung\b", r"\bnoch eine buchung\b", r"\bneue reservierung\b",
+    r"\bweitere reservierung\b", r"\bnoch eine reservierung\b",
+    r"\bnochmal reservieren\b", r"\bnoch einmal reservieren\b",
     # AR
-    r"حجز جديد",
-    r"حجز آخر",
-    r"احجز مرة أخرى",
-    r"أحجز مرة أخرى",
-    r"حجز مرة أخرى",
-    r"حجز ثاني",
+    r"حجز جديد", r"حجز آخر", r"احجز مرة أخرى", r"أحجز مرة أخرى", r"حجز مرة أخرى", r"حجز ثاني",
 ]
 
 def looks_like_booking(q: str) -> bool:
-    ql = (q or "").lower()
-    return any(re.search(p, ql, flags=re.IGNORECASE) for p in _BOOKING_PATTERNS)
-
+    text = q or ""
+    return any(re.search(p, text, flags=re.IGNORECASE) for p in _BOOKING_PATTERNS)
 
 def wants_new_booking(q: str) -> bool:
-    ql = (q or "").lower()
-    return any(re.search(p, ql, flags=re.IGNORECASE) for p in _NEW_BOOKING_PATTERNS)
-
+    text = q or ""
+    return any(re.search(p, text, flags=re.IGNORECASE) for p in _NEW_BOOKING_PATTERNS)
 
 def wants_human(q: str) -> bool:
     ql = (q or "").lower()
     triggers = ["human", "real person", "abood", "instructor", "call me", "contact", "whatsapp", "agent"]
     return any(t in ql for t in triggers)
 
-
 def is_medical_or_high_risk(q: str) -> bool:
     ql = (q or "").lower()
     triggers = ["faint", "blackout", "lung", "pain", "injury", "blood", "doctor", "medical", "pregnan", "asthma"]
     return any(t in ql for t in triggers)
 
-
 def can_send_booking_email() -> bool:
-    # Your code calls this; previously it was missing and would crash.
     return bool(OWNER_NOTIFY_EMAIL and SENDGRID_API_KEY)
+
+
+# =========================
+# Conversation log helpers
+# =========================
+def log_message(session_id: str, role: str, text: str):
+    if not session_id or not role or text is None:
+        return
+    conn = db()
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO conversation_log(session_id, role, text, ts) VALUES(?,?,?,?)",
+        (session_id, role, text, now_ts()),
+    )
+    conn.commit()
+    conn.close()
+
+def get_conversation(session_id: str, limit: int = 300) -> List[Dict[str, Any]]:
+    conn = db()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT role, text, ts FROM conversation_log WHERE session_id=? ORDER BY ts ASC, id ASC LIMIT ?",
+        (session_id, int(limit)),
+    )
+    rows = cur.fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+# =========================
+# Human takeover state + tickets
+# =========================
+def set_human_mode(session_id: str, human_mode: bool):
+    conn = db()
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO session_state(session_id, human_mode, updated_at) VALUES(?,?,?) "
+        "ON CONFLICT(session_id) DO UPDATE SET human_mode=excluded.human_mode, updated_at=excluded.updated_at",
+        (session_id, 1 if human_mode else 0, now_ts()),
+    )
+    conn.commit()
+    conn.close()
+
+def is_human_mode(session_id: str) -> bool:
+    conn = db()
+    cur = conn.cursor()
+    cur.execute("SELECT human_mode FROM session_state WHERE session_id=?", (session_id,))
+    row = cur.fetchone()
+    conn.close()
+    return bool(row and int(row["human_mode"]) == 1)
+
+def upsert_support_request(session_id: str, user_message: str, page_url: str):
+    conn = db()
+    cur = conn.cursor()
+    ts = now_ts()
+    cur.execute(
+        "SELECT id FROM support_requests WHERE session_id=? AND status='open' ORDER BY updated_at DESC LIMIT 1",
+        (session_id,),
+    )
+    row = cur.fetchone()
+    if row:
+        cur.execute(
+            "UPDATE support_requests SET user_message=?, page_url=?, updated_at=? WHERE id=?",
+            (user_message, page_url or "", ts, int(row["id"])),
+        )
+    else:
+        cur.execute(
+            "INSERT INTO support_requests(session_id,status,user_message,page_url,created_at,updated_at) VALUES(?,?,?,?,?,?)",
+            (session_id, "open", user_message, page_url or "", ts, ts),
+        )
+    conn.commit()
+    conn.close()
+
+def close_support_request(session_id: str):
+    conn = db()
+    cur = conn.cursor()
+    ts = now_ts()
+    cur.execute(
+        "UPDATE support_requests SET status='closed', updated_at=? WHERE session_id=? AND status='open'",
+        (ts, session_id),
+    )
+    conn.commit()
+    conn.close()
+
+def list_support_requests(status: str = "open") -> List[Dict[str, Any]]:
+    conn = db()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT * FROM support_requests WHERE status=? ORDER BY updated_at DESC LIMIT 200",
+        (status,),
+    )
+    rows = cur.fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+def list_booking_requests(status: str = "pending") -> List[Dict[str, Any]]:
+    conn = db()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT * FROM booking_requests WHERE status=? ORDER BY updated_at DESC LIMIT 200",
+        (status,),
+    )
+    rows = cur.fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
 
 
 # =========================
@@ -326,7 +438,6 @@ async def embed_text(text: str) -> List[float]:
         return list(resp.data[0].embedding)
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"OpenAI embeddings failed: {str(e)}")
-
 
 async def generate_answer(system: str, user: str) -> str:
     try:
@@ -351,12 +462,7 @@ def send_email(to_email: str, subject: str, html: str):
         raise RuntimeError("SENDGRID_API_KEY not set")
     if not to_email:
         raise RuntimeError("OWNER_NOTIFY_EMAIL not set")
-
-    # IMPORTANT:
-    # - For best deliverability with SendGrid, SMTP_FROM should be a verified sender/domain in SendGrid.
-    # - If SMTP_FROM is invalid/unverified, SendGrid may accept but your mail can be dropped.
     from_email = SMTP_FROM or to_email
-
     payload = {
         "personalizations": [{"to": [{"email": to_email}]}],
         "from": {"email": from_email},
@@ -387,11 +493,7 @@ def serpapi_search(query: str) -> List[Dict[str, str]]:
         out = []
         for item in data.get("organic_results", [])[:5]:
             out.append(
-                {
-                    "title": item.get("title", ""),
-                    "link": item.get("link", ""),
-                    "snippet": item.get("snippet", ""),
-                }
+                {"title": item.get("title", ""), "link": item.get("link", ""), "snippet": item.get("snippet", "")}
             )
         return out
     except Exception:
@@ -416,7 +518,6 @@ def parse_sitemap_urls(xml_text: str, site_base_url: str) -> List[str]:
         if len(urls) >= MAX_URLS:
             break
     return urls
-
 
 async def build_index():
     if not SITE_SITEMAP_URL:
@@ -461,7 +562,6 @@ async def build_index():
     conn.close()
     print("Index build complete.")
 
-
 async def retrieve_site_context(question: str) -> Tuple[List[Dict[str, Any]], float]:
     if chunks_count() == 0:
         return [], 0.0
@@ -489,7 +589,6 @@ async def retrieve_site_context(question: str) -> Tuple[List[Dict[str, Any]], fl
     scored.sort(key=lambda x: x[0], reverse=True)
     top = scored[:TOP_K]
     confidence = float(top[0][0]) if top else 0.0
-
     chunks = [{"score": s, "url": u, "title": (t or ""), "text": tx} for (s, u, t, tx) in top]
     return chunks, confidence
 
@@ -504,14 +603,12 @@ def ensure_session(session_id: str):
     conn.commit()
     conn.close()
 
-
 def add_human_message(session_id: str, text: str):
     conn = db()
     cur = conn.cursor()
     cur.execute("INSERT INTO human_messages(session_id, text, ts) VALUES(?,?,?)", (session_id, text, now_ts()))
     conn.commit()
     conn.close()
-
 
 def get_human_messages(session_id: str) -> List[Dict[str, Any]]:
     conn = db()
@@ -523,7 +620,7 @@ def get_human_messages(session_id: str) -> List[Dict[str, Any]]:
 
 
 # =========================
-# Booking flow
+# Booking flow helpers
 # =========================
 def create_booking_request(session_id: str, details: Dict[str, Any]) -> int:
     conn = db()
@@ -538,14 +635,12 @@ def create_booking_request(session_id: str, details: Dict[str, Any]) -> int:
     conn.close()
     return int(booking_id)
 
-
 def update_booking_status(booking_id: int, status: str):
     conn = db()
     cur = conn.cursor()
     cur.execute("UPDATE booking_requests SET status=?, updated_at=? WHERE id=?", (status, now_ts(), booking_id))
     conn.commit()
     conn.close()
-
 
 def get_booking(booking_id: int) -> Dict[str, Any]:
     conn = db()
@@ -556,7 +651,6 @@ def get_booking(booking_id: int) -> Dict[str, Any]:
     if not row:
         raise HTTPException(status_code=404, detail="Booking not found")
     return dict(row)
-
 
 def get_latest_booking_for_session(session_id: str) -> Optional[Dict[str, Any]]:
     conn = db()
@@ -569,32 +663,22 @@ def get_latest_booking_for_session(session_id: str) -> Optional[Dict[str, Any]]:
     conn.close()
     return dict(row) if row else None
 
-
 def build_contact_form_url(page_url: str = "", lang: str = "en") -> str:
-    # 1) Single override
     if CONTACT_FORM_URL:
         return CONTACT_FORM_URL
-
-    # 2) Language-specific
     if (lang or "").lower().startswith("ar"):
         return CONTACT_FORM_URL_AR
     if (lang or "").lower().startswith("de"):
         return CONTACT_FORM_URL_DE
-
-    # default English
     if CONTACT_FORM_URL_EN:
         return CONTACT_FORM_URL_EN
-
-    # 3/4/5) Backward compatible fallback
     if SITE_BASE_URL:
         return SITE_BASE_URL.rstrip("/") + "/" + CONTACT_FORM_PATH.lstrip("/")
-
     if page_url:
         m = re.match(r"^(https?://[^/]+)", page_url.strip())
         if m:
             return m.group(1).rstrip("/") + "/" + CONTACT_FORM_PATH.lstrip("/")
     return CONTACT_FORM_PATH
-
 
 def make_approval_links(base_url: str, booking_id: int) -> Tuple[str, str]:
     token = serializer.dumps({"booking_id": booking_id})
@@ -627,14 +711,17 @@ class ChatRequest(BaseModel):
     history: Optional[List[Dict[str, Any]]] = None
     page_url: Optional[str] = None
 
-
 class ChatResponse(BaseModel):
     answer: str
     needs_human: bool = False
     booking_pending: bool = False
     booking_next_url: Optional[str] = None
-    sources: Optional[List[Dict[str, str]]] = None  # you can ignore on frontend
+    sources: Optional[List[Dict[str, str]]] = None
 
+class AdminMessageRequest(BaseModel):
+    session_id: str
+    text: str
+    close: bool = False
 
 index_task = None
 
@@ -664,9 +751,36 @@ async def chat(req: ChatRequest):
 
     ensure_session(req.session_id)
     q = req.question.strip()
+    log_message(req.session_id, "user", q)
 
-    # Human takeover / safety
+    # If this session is in takeover mode, never answer with AI.
+    if is_human_mode(req.session_id):
+        upsert_support_request(req.session_id, q, req.page_url or "")
+
+        if can_send_booking_email():
+            try:
+                send_email(
+                    OWNER_NOTIFY_EMAIL,
+                    "Abood Freediver: Human takeover message",
+                    f"""
+                    <h3>Human takeover message</h3>
+                    <p><b>Session:</b> {req.session_id}</p>
+                    <p><b>Page:</b> {req.page_url or ''}</p>
+                    <p><b>User message:</b> {q}</p>
+                    """,
+                )
+            except Exception as e:
+                print("Email takeover notify failed:", str(e))
+
+        answer = "Thanks — this is the Abood Freediver team. Abood will reply here shortly."
+        log_message(req.session_id, "assistant", answer)
+        return ChatResponse(answer=answer, needs_human=True, booking_pending=False, booking_next_url=None, sources=[])
+
+    # Human takeover / safety triggers
     if is_medical_or_high_risk(q) or wants_human(q):
+        set_human_mode(req.session_id, True)
+        upsert_support_request(req.session_id, q, req.page_url or "")
+
         if can_send_booking_email():
             try:
                 send_email(
@@ -682,44 +796,33 @@ async def chat(req: ChatRequest):
             except Exception as e:
                 print("Email notify failed:", str(e))
 
-        return ChatResponse(
-            answer=(
-                "Thanks — this is the Abood Freediver team. "
-                "For safety and accuracy, Abood will reply directly. "
-                "Please share your name and preferred contact (WhatsApp or email)."
-            ),
-            needs_human=True,
-            booking_pending=False,
-            sources=[],
+        answer = (
+            "Thanks — this is the Abood Freediver team. "
+            "For safety and accuracy, Abood will reply directly here. "
+            "Please share your name and preferred contact (WhatsApp or email)."
         )
+        log_message(req.session_id, "assistant", answer)
+        return ChatResponse(answer=answer, needs_human=True, booking_pending=False, booking_next_url=None, sources=[])
 
     latest_booking = get_latest_booking_for_session(req.session_id)
 
-    # If user asks booking AND there is an existing booking for this session
     if latest_booking and looks_like_booking(q):
         status = (latest_booking.get("status") or "").lower()
-
         details = {}
         try:
             details = json.loads(latest_booking.get("details_json") or "{}")
         except Exception:
             details = {}
 
-        # If pending → always keep pending until you approve/deny
         if status == "pending":
-            return ChatResponse(
-                answer=(
-                    "Your booking request is still pending Abood’s approval.\n\n"
-                    "If you want to update anything (date/time, number of people, contact), "
-                    "tell us here and we will forward it."
-                ),
-                needs_human=True,
-                booking_pending=True,
-                booking_next_url=None,
-                sources=[],
+            answer = (
+                "Your booking request is still pending Abood’s approval.\n\n"
+                "If you want to update anything (date/time, number of people, contact), "
+                "tell us here and we will forward it."
             )
+            log_message(req.session_id, "assistant", answer)
+            return ChatResponse(answer=answer, needs_human=True, booking_pending=True, booking_next_url=None, sources=[])
 
-        # If approved/denied but user explicitly wants a NEW booking → create new pending request
         if status in ("approved", "denied") and wants_new_booking(q):
             details2 = {"question": q, "page_url": req.page_url or "", "history": req.history or []}
             booking_id = create_booking_request(req.session_id, details2)
@@ -744,51 +847,37 @@ async def chat(req: ChatRequest):
                 except Exception as e:
                     print("Email booking notify failed:", str(e))
 
-            return ChatResponse(
-                answer=(
-                    "I can take your new booking request, but I can’t confirm it until Abood approves.\n\n"
-                    "Please share:\n"
-                    "1) Desired date(s) + time window\n"
-                    "2) Number of people\n"
-                    "3) Your contact (WhatsApp or email)\n\n"
-                    "I’ve sent your request to Abood for approval."
-                ),
-                needs_human=True,
-                booking_pending=True,
-                booking_next_url=None,
-                sources=[],
+            answer = (
+                "I can take your new booking request, but I can’t confirm it until Abood approves.\n\n"
+                "Please share:\n"
+                "1) Desired date(s) + time window\n"
+                "2) Number of people\n"
+                "3) Your contact (WhatsApp or email)\n\n"
+                "I’ve sent your request to Abood for approval."
             )
+            log_message(req.session_id, "assistant", answer)
+            return ChatResponse(answer=answer, needs_human=True, booking_pending=True, booking_next_url=None, sources=[])
 
-        # Otherwise: repeat existing status message (no new booking)
         if status == "approved":
             lang = detect_language(q, req.history)
             contact_url = build_contact_form_url(details.get("page_url", req.page_url or ""), lang=lang)
-            return ChatResponse(
-                answer=(
-                    "Approved — please continue the booking on our contact form here:\n"
-                    f"{contact_url}\n\n"
-                    "After you submit the form, you can keep chatting here if you have questions."
-                ),
-                needs_human=False,
-                booking_pending=False,
-                booking_next_url=contact_url,
-                sources=[],
+            answer = (
+                "Approved — please continue the booking on our contact form here:\n"
+                f"{contact_url}\n\n"
+                "After you submit the form, you can keep chatting here if you have questions."
             )
+            log_message(req.session_id, "assistant", answer)
+            return ChatResponse(answer=answer, needs_human=False, booking_pending=False, booking_next_url=contact_url, sources=[])
 
         if status == "denied":
-            return ChatResponse(
-                answer=(
-                    "Sorry — we couldn’t approve that booking request.\n"
-                    "If you want, you can try different dates/times.\n"
-                    "You can also ask any other questions here."
-                ),
-                needs_human=False,
-                booking_pending=False,
-                booking_next_url=None,
-                sources=[],
+            answer = (
+                "Sorry — we couldn’t approve that booking request.\n"
+                "If you want, you can try different dates/times.\n"
+                "You can also ask any other questions here."
             )
+            log_message(req.session_id, "assistant", answer)
+            return ChatResponse(answer=answer, needs_human=False, booking_pending=False, booking_next_url=None, sources=[])
 
-    # Booking request -> email notify + pending
     if looks_like_booking(q):
         details = {"question": q, "page_url": req.page_url or "", "history": req.history or []}
         booking_id = create_booking_request(req.session_id, details)
@@ -813,22 +902,18 @@ async def chat(req: ChatRequest):
             except Exception as e:
                 print("Email booking notify failed:", str(e))
 
-        return ChatResponse(
-            answer=(
-                "This is the Abood Freediver team. I can take your booking request, but I can’t confirm it until Abood approves.\n\n"
-                "Please share:\n"
-                "1) Desired date(s) + time window\n"
-                "2) Number of people\n"
-                "3) Your contact (WhatsApp or email)\n\n"
-                "I’ve sent your request to Abood for approval."
-            ),
-            needs_human=True,
-            booking_pending=True,
-            booking_next_url=None,
-            sources=[],
+        answer = (
+            "This is the Abood Freediver team. I can take your booking request, but I can’t confirm it until Abood approves.\n\n"
+            "Please share:\n"
+            "1) Desired date(s) + time window\n"
+            "2) Number of people\n"
+            "3) Your contact (WhatsApp or email)\n\n"
+            "I’ve sent your request to Abood for approval."
         )
+        log_message(req.session_id, "assistant", answer)
+        return ChatResponse(answer=answer, needs_human=True, booking_pending=True, booking_next_url=None, sources=[])
 
-    # Retrieval
+    # Retrieval + AI answer
     chunks, conf = await retrieve_site_context(q)
 
     system = (
@@ -864,13 +949,14 @@ async def chat(req: ChatRequest):
     )
 
     answer = await generate_answer(system, prompt)
+    log_message(req.session_id, "assistant", answer)
 
     out_sources = sources[:4] if chunks and conf >= MIN_CONFIDENCE else []
     for r in web_results[:3]:
         if r.get("link"):
             out_sources.append({"title": r.get("title", "Web source"), "url": r["link"]})
 
-    return ChatResponse(answer=answer, needs_human=False, booking_pending=False, sources=out_sources)
+    return ChatResponse(answer=answer, needs_human=False, booking_pending=False, booking_next_url=None, sources=out_sources)
 
 
 @app.get("/chat/status")
@@ -878,6 +964,9 @@ def chat_status(session_id: str = Query(...)):
     return {"messages": get_human_messages(session_id)}
 
 
+# =========================
+# Email-token booking approval/deny
+# =========================
 @app.get("/admin/booking/approve")
 def approve_booking(token: str = Query(...)):
     try:
@@ -902,6 +991,7 @@ def approve_booking(token: str = Query(...)):
         booking["session_id"],
         f"Approved ✅\nPlease continue the booking on our contact form: {contact_url}\nAfter you submit the form, you can keep chatting here if you have any questions.",
     )
+    log_message(booking["session_id"], "human", f"Approved ✅ link shared: {contact_url}")
     return {"ok": True, "status": "approved", "booking_id": booking_id}
 
 
@@ -920,9 +1010,268 @@ def deny_booking(token: str = Query(...)):
         booking["session_id"],
         "Sorry — we can’t approve this booking request right now.\nIf you share alternative dates/times (and your experience level), we can check again.\nIf you have any other questions, you can ask here.",
     )
+    log_message(booking["session_id"], "human", "Denied booking request (email-token).")
     return {"ok": True, "status": "denied", "booking_id": booking_id}
 
 
+# =========================
+# Admin dashboard + APIs (Basic Auth)
+# =========================
+@app.get("/admin/dashboard", response_class=HTMLResponse)
+def admin_dashboard(creds: HTTPBasicCredentials = Depends(security)):
+    require_admin(creds)
+
+    html = """
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <title>Abood Freediver Admin</title>
+  <style>
+    body{font-family:Arial, sans-serif; margin:20px;}
+    h2{margin-top:28px;}
+    table{border-collapse:collapse; width:100%;}
+    th,td{border:1px solid #ddd; padding:8px; vertical-align:top;}
+    th{background:#f5f5f5;}
+    textarea{width:100%; height:70px;}
+    button{padding:8px 12px; margin-right:6px; cursor:pointer;}
+    .row-actions{white-space:nowrap;}
+    .muted{color:#666; font-size:12px;}
+    pre{margin:0;}
+    .pill{display:inline-block;padding:2px 8px;border-radius:999px;background:#eee;font-size:12px;margin-left:6px;}
+    .modal-backdrop{position:fixed; inset:0; background:rgba(0,0,0,.5); display:none; align-items:center; justify-content:center;}
+    .modal{background:#fff; width:min(1000px, 95vw); max-height:90vh; overflow:auto; border-radius:10px; padding:14px;}
+    .modal h3{margin:6px 0 12px 0;}
+    .chatline{padding:10px; border:1px solid #eee; border-radius:10px; margin-bottom:10px;}
+    .chatline .meta{font-size:12px; color:#666; margin-bottom:6px;}
+    .chatline.user{background:#f8fbff;}
+    .chatline.assistant{background:#fbfff8;}
+    .chatline.human{background:#fff8fb;}
+    .closebtn{float:right;}
+  </style>
+</head>
+<body>
+  <h1>Abood Freediver Admin Dashboard</h1>
+  <div class="muted">Protected by Basic Auth (ADMIN_USER / ADMIN_PASS).</div>
+
+  <h2>Pending Bookings</h2>
+  <table id="bookingsTbl">
+    <thead><tr><th>ID</th><th>Session</th><th>Details</th><th>Updated</th><th>Actions</th></tr></thead>
+    <tbody></tbody>
+  </table>
+
+  <h2>Open Human Help Requests</h2>
+  <table id="supportTbl">
+    <thead><tr><th>Session</th><th>Message</th><th>Page</th><th>Updated</th><th>Conversation</th><th>Send Reply</th></tr></thead>
+    <tbody></tbody>
+  </table>
+
+  <div class="modal-backdrop" id="backdrop">
+    <div class="modal">
+      <button class="closebtn" onclick="closeModal()">Close</button>
+      <h3>Conversation: <span id="convTitle"></span></h3>
+      <div id="convBody"></div>
+    </div>
+  </div>
+
+<script>
+async function apiGet(url){
+  const r = await fetch(url, {credentials:"include"});
+  if(!r.ok){ throw new Error(await r.text()); }
+  return await r.json();
+}
+async function apiPost(url, body){
+  const r = await fetch(url, {
+    method:"POST",
+    headers: {"Content-Type":"application/json"},
+    body: JSON.stringify(body || {}),
+    credentials:"include"
+  });
+  if(!r.ok){ throw new Error(await r.text()); }
+  return await r.json();
+}
+function fmtTs(ts){
+  if(!ts) return "";
+  const d = new Date(ts*1000);
+  return d.toLocaleString();
+}
+function esc(s){ return (s||"").replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m])); }
+
+async function loadBookings(){
+  const data = await apiGet("/admin/api/bookings?status=pending");
+  const tb = document.querySelector("#bookingsTbl tbody");
+  tb.innerHTML = "";
+  (data.items || []).forEach(it => {
+    let details = it.details_json || "";
+    try{ details = JSON.stringify(JSON.parse(details), null, 2); }catch(e){}
+    const tr = document.createElement("tr");
+    tr.innerHTML = `
+      <td>${it.id}</td>
+      <td>${esc(it.session_id)}</td>
+      <td><pre style="white-space:pre-wrap">${esc(details)}</pre></td>
+      <td>${fmtTs(it.updated_at)}</td>
+      <td class="row-actions">
+        <button onclick="approveBooking(${it.id})">Approve</button>
+        <button onclick="denyBooking(${it.id})">Deny</button>
+      </td>
+    `;
+    tb.appendChild(tr);
+  });
+}
+
+async function approveBooking(id){
+  await apiPost(`/admin/api/bookings/${id}/approve`, {});
+  await loadBookings();
+}
+async function denyBooking(id){
+  await apiPost(`/admin/api/bookings/${id}/deny`, {});
+  await loadBookings();
+}
+
+async function loadSupport(){
+  const data = await apiGet("/admin/api/support?status=open");
+  const tb = document.querySelector("#supportTbl tbody");
+  tb.innerHTML = "";
+  (data.items || []).forEach(it => {
+    const page = it.page_url || "";
+    const tr = document.createElement("tr");
+    tr.innerHTML = `
+      <td>${esc(it.session_id)}</td>
+      <td>${esc(it.user_message)}</td>
+      <td>${page ? `<a target="_blank" href="${esc(page)}">${esc(page)}</a>` : ""}</td>
+      <td>${fmtTs(it.updated_at)}</td>
+      <td><button onclick="openConversation('${esc(it.session_id)}')">View</button></td>
+      <td>
+        <textarea placeholder="Type your reply..." id="msg_${esc(it.session_id)}"></textarea>
+        <div>
+          <button onclick="sendReply('${esc(it.session_id)}', false)">Send</button>
+          <button onclick="sendReply('${esc(it.session_id)}', true)">Send & Close</button>
+        </div>
+      </td>
+    `;
+    tb.appendChild(tr);
+  });
+}
+
+async function sendReply(sessionId, closeIt){
+  const el = document.getElementById("msg_" + sessionId);
+  const text = (el && el.value || "").trim();
+  if(!text){ alert("Write a message first"); return; }
+  await apiPost("/admin/api/support/message", {session_id: sessionId, text, close: closeIt});
+  if(el) el.value = "";
+  await loadSupport();
+}
+
+function closeModal(){
+  document.getElementById("backdrop").style.display = "none";
+  document.getElementById("convBody").innerHTML = "";
+  document.getElementById("convTitle").textContent = "";
+}
+
+async function openConversation(sessionId){
+  const data = await apiGet(`/admin/api/conversation?session_id=${encodeURIComponent(sessionId)}&limit=300`);
+  document.getElementById("convTitle").textContent = sessionId;
+  const body = document.getElementById("convBody");
+  body.innerHTML = "";
+
+  (data.items || []).forEach(m => {
+    const role = (m.role || "").toLowerCase();
+    const div = document.createElement("div");
+    div.className = "chatline " + (role || "assistant");
+    div.innerHTML = `
+      <div class="meta"><b>${esc(role)}</b> <span class="pill">${esc(fmtTs(m.ts))}</span></div>
+      <div>${esc(m.text || "").replace(/\\n/g, "<br>")}</div>
+    `;
+    body.appendChild(div);
+  });
+
+  document.getElementById("backdrop").style.display = "flex";
+}
+
+(async function init(){
+  await loadBookings();
+  await loadSupport();
+  setInterval(async ()=>{ await loadBookings(); await loadSupport(); }, 5000);
+})();
+</script>
+</body>
+</html>
+"""
+    return HTMLResponse(content=html)
+
+
+@app.get("/admin/api/bookings")
+def admin_api_bookings(status: str = "pending", creds: HTTPBasicCredentials = Depends(security)):
+    require_admin(creds)
+    return {"items": list_booking_requests(status=status)}
+
+
+@app.post("/admin/api/bookings/{booking_id}/approve")
+def admin_api_approve_booking(booking_id: int, creds: HTTPBasicCredentials = Depends(security)):
+    require_admin(creds)
+    booking = get_booking(booking_id)
+    update_booking_status(booking_id, "approved")
+
+    details = {}
+    try:
+        details = json.loads(booking.get("details_json") or "{}")
+    except Exception:
+        details = {}
+
+    lang = detect_language(details.get("question", ""), details.get("history") or [])
+    contact_url = build_contact_form_url(details.get("page_url", ""), lang=lang)
+
+    msg = f"Approved ✅\nPlease continue the booking on our contact form: {contact_url}\nAfter you submit the form, you can keep chatting here if you have any questions."
+    add_human_message(booking["session_id"], msg)
+    log_message(booking["session_id"], "human", msg)
+    return {"ok": True}
+
+
+@app.post("/admin/api/bookings/{booking_id}/deny")
+def admin_api_deny_booking(booking_id: int, creds: HTTPBasicCredentials = Depends(security)):
+    require_admin(creds)
+    booking = get_booking(booking_id)
+    update_booking_status(booking_id, "denied")
+
+    msg = (
+        "Sorry — we can’t approve this booking request right now.\n"
+        "If you share alternative dates/times (and your experience level), we can check again.\n"
+        "If you have any other questions, you can ask here."
+    )
+    add_human_message(booking["session_id"], msg)
+    log_message(booking["session_id"], "human", msg)
+    return {"ok": True}
+
+
+@app.get("/admin/api/support")
+def admin_api_support(status: str = "open", creds: HTTPBasicCredentials = Depends(security)):
+    require_admin(creds)
+    return {"items": list_support_requests(status=status)}
+
+
+@app.post("/admin/api/support/message")
+def admin_api_support_message(req: AdminMessageRequest, creds: HTTPBasicCredentials = Depends(security)):
+    require_admin(creds)
+
+    add_human_message(req.session_id, req.text)
+    log_message(req.session_id, "human", req.text)
+
+    if req.close:
+        close_support_request(req.session_id)
+        set_human_mode(req.session_id, False)
+
+    return {"ok": True}
+
+
+@app.get("/admin/api/conversation")
+def admin_api_conversation(session_id: str = Query(...), limit: int = 300, creds: HTTPBasicCredentials = Depends(security)):
+    require_admin(creds)
+    return {"items": get_conversation(session_id, limit=limit)}
+
+
+# =========================
+# Index admin endpoints
+# =========================
 @app.get("/admin/index/status")
 def index_status():
     return {"chunks": chunks_count()}
