@@ -879,7 +879,7 @@ async def chat(req: ChatRequest):
         return ChatResponse(answer=answer, needs_human=True, booking_pending=False, booking_next_url=None, sources=[])
 
     # Human takeover / safety triggers
-    if is_medical_or_high_risk(q) or wants_human(q):
+    if is_medical_or_high_risk(q) or wants_human(q) or looks_like_payment(q):
         set_human_mode(req.session_id, True)
         upsert_support_request(req.session_id, q, req.page_url or "", reason="human")
 
