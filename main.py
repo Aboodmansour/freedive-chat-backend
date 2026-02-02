@@ -1117,6 +1117,30 @@ function clearDraft(sessionId){
 }
 
 /* -----------------------------
+   Auto-refresh pause while typing
+   - pauses refresh on any textarea input/focus
+   - resumes after 10s of inactivity
+----------------------------- */
+let refreshPausedUntil = 0;
+let refreshResumeTimer = null;
+const REFRESH_RESUME_MS = 10_000;
+
+function pauseRefreshForTyping(){
+  refreshPausedUntil = Date.now() + REFRESH_RESUME_MS;
+  if(refreshResumeTimer) clearTimeout(refreshResumeTimer);
+  refreshResumeTimer = setTimeout(() => {
+    // Only truly resume if no new typing occurred since scheduling
+    if(Date.now() >= refreshPausedUntil){
+      refreshPausedUntil = 0;
+    }
+  }, REFRESH_RESUME_MS + 50);
+}
+
+function isRefreshPaused(){
+  return Date.now() < refreshPausedUntil;
+}
+
+/* -----------------------------
    Bookings (unchanged)
 ----------------------------- */
 async function loadBookings(){
@@ -1155,11 +1179,9 @@ async function denyBooking(id){
 function getSupportTbody(){
   return document.querySelector("#supportTbl tbody");
 }
-
 function getRow(sessionId){
   return document.querySelector(`#supportTbl tbody tr[data-session="${CSS.escape(sessionId)}"]`);
 }
-
 function currentFocusInfo(){
   const ae = document.activeElement;
   if(!ae) return null;
@@ -1172,15 +1194,12 @@ function currentFocusInfo(){
     selectionEnd: ae.selectionEnd
   };
 }
-
 function restoreFocus(info){
   if(!info) return;
   const ta = document.querySelector(`textarea.reply-box[data-session="${CSS.escape(info.sessionId)}"]`);
   if(!ta) return;
   ta.focus();
-  try{
-    ta.setSelectionRange(info.selectionStart, info.selectionEnd);
-  }catch(_){}
+  try{ ta.setSelectionRange(info.selectionStart, info.selectionEnd); }catch(_){}
 }
 
 function ensureRow(it){
@@ -1202,7 +1221,7 @@ function ensureRow(it){
     `;
     tb.appendChild(tr);
 
-    // Build reply cell once (so textarea node persists forever unless row removed)
+    // Reply cell (created once; preserved)
     const replyTd = tr.querySelector(".col-reply");
     replyTd.innerHTML = `
       <textarea
@@ -1218,14 +1237,19 @@ function ensureRow(it){
       </div>
     `;
 
-    // Wire textarea draft saving
     const ta = replyTd.querySelector("textarea.reply-box");
     const draft = loadDraft(sid);
     if(draft) ta.value = draft;
 
-    ta.addEventListener("input", () => saveDraft(sid, ta.value || ""));
+    // Pause refresh while typing / focusing
+    ta.addEventListener("focus", pauseRefreshForTyping);
+    ta.addEventListener("keydown", pauseRefreshForTyping);
+    ta.addEventListener("input", () => {
+      pauseRefreshForTyping();
+      saveDraft(sid, ta.value || "");
+    });
 
-    // Wire buttons
+    // Buttons
     replyTd.querySelector(".btn-send").addEventListener("click", () => sendReply(sid, false));
     replyTd.querySelector(".btn-send-close").addEventListener("click", () => sendReply(sid, true));
 
@@ -1234,7 +1258,7 @@ function ensureRow(it){
     tr.querySelector(".btn-view").addEventListener("click", () => openConversation(sid));
   }
 
-  // Update non-input columns safely (no replacing textarea)
+  // Update non-input columns (safe)
   tr.querySelector(".col-session").textContent = sid;
   tr.querySelector(".col-msg").textContent = it.user_message || "";
 
@@ -1249,32 +1273,32 @@ function ensureRow(it){
 }
 
 async function loadSupport(){
-  const focusInfo = currentFocusInfo(); // capture focus/cursor before updates
+  // If admin is typing, do not refresh
+  if(isRefreshPaused()) return;
+
+  const focusInfo = currentFocusInfo();
 
   const data = await apiGet("/admin/api/support?status=open");
   const items = (data.items || []);
   const seen = new Set();
 
-  // Upsert rows
   items.forEach(it => {
     if(!it || !it.session_id) return;
     seen.add(it.session_id);
     ensureRow(it);
   });
 
-  // Remove rows that are no longer present
   const tb = getSupportTbody();
   Array.from(tb.querySelectorAll("tr[data-session]")).forEach(tr => {
     const sid = tr.getAttribute("data-session");
     if(sid && !seen.has(sid)){
-      // save draft before removing just in case
       const ta = tr.querySelector("textarea.reply-box");
       if(ta) saveDraft(sid, ta.value || "");
       tr.remove();
     }
   });
 
-  restoreFocus(focusInfo); // restore focus/cursor after patch
+  restoreFocus(focusInfo);
 }
 
 async function sendReply(sessionId, closeIt){
@@ -1284,6 +1308,9 @@ async function sendReply(sessionId, closeIt){
 
   const text = (el && el.value || "").trim();
   if(!text){ alert("Write a message first"); return; }
+
+  // Pause refresh while sending too
+  pauseRefreshForTyping();
 
   if(td) td.classList.add("sending");
   if(statusEl) statusEl.textContent = "Sending...";
@@ -1295,6 +1322,8 @@ async function sendReply(sessionId, closeIt){
     if(el) el.value = "";
     if(statusEl) statusEl.textContent = closeIt ? "Sent & closed." : "Sent.";
 
+    // force a refresh after send (even if paused)
+    refreshPausedUntil = 0;
     await loadSupport();
   }catch(err){
     if(statusEl) statusEl.textContent = "Error sending.";
@@ -1314,6 +1343,8 @@ function closeModal(){
 }
 
 async function openConversation(sessionId){
+  pauseRefreshForTyping(); // avoid refresh while reading modal
+
   const data = await apiGet(`/admin/api/conversation?session_id=${encodeURIComponent(sessionId)}&limit=300`);
   document.getElementById("convTitle").textContent = sessionId;
   const body = document.getElementById("convBody");
@@ -1334,20 +1365,30 @@ async function openConversation(sessionId){
 }
 
 /* -----------------------------
-   Init
+   Init + polling
 ----------------------------- */
-(async function init(){
-  await loadBookings();
-  await loadSupport();
+let pollTimer = null;
 
-  setInterval(async ()=>{
-    try{
-      await loadBookings();
-      await loadSupport();
-    }catch(e){
-      console.error(e);
-    }
-  }, 5000);
+async function pollOnce(){
+  try{
+    await loadBookings();
+    await loadSupport();
+  }catch(e){
+    console.error(e);
+  }
+}
+
+(async function init(){
+  await pollOnce();
+  pollTimer = setInterval(pollOnce, 5000);
+
+  // Global listeners: if user clicks/focuses any textarea, pause refresh
+  document.addEventListener("focusin", (e) => {
+    if(e.target && e.target.tagName === "TEXTAREA") pauseRefreshForTyping();
+  });
+  document.addEventListener("keydown", (e) => {
+    if(e.target && e.target.tagName === "TEXTAREA") pauseRefreshForTyping();
+  });
 })();
 </script>
 </body>
