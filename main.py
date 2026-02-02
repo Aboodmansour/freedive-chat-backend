@@ -1021,7 +1021,7 @@ def deny_booking(token: str = Query(...)):
 def admin_dashboard(creds: HTTPBasicCredentials = Depends(security)):
     require_admin(creds)
 
-    html = """
+    html = r"""
 <!doctype html>
 <html>
 <head>
@@ -1048,6 +1048,9 @@ def admin_dashboard(creds: HTTPBasicCredentials = Depends(security)):
     .chatline.assistant{background:#fbfff8;}
     .chatline.human{background:#fff8fb;}
     .closebtn{float:right;}
+
+    .sending { opacity: 0.6; pointer-events: none; }
+    .small { font-size:12px; color:#666; }
   </style>
 </head>
 <body>
@@ -1068,7 +1071,7 @@ def admin_dashboard(creds: HTTPBasicCredentials = Depends(security)):
 
   <div class="modal-backdrop" id="backdrop">
     <div class="modal">
-      <button class="closebtn" onclick="closeModal()">Close</button>
+      <button class="closebtn" type="button" onclick="closeModal()">Close</button>
       <h3>Conversation: <span id="convTitle"></span></h3>
       <div id="convBody"></div>
     </div>
@@ -1095,8 +1098,53 @@ function fmtTs(ts){
   const d = new Date(ts*1000);
   return d.toLocaleString();
 }
-function esc(s){ return (s||"").replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m])); }
+function esc(s){
+  return (s||"").replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
+}
 
+/* -----------------------------
+   Draft persistence (FIX)
+----------------------------- */
+function draftKey(sessionId){ return "draft_reply_" + sessionId; }
+
+function saveDraft(sessionId, value){
+  try { localStorage.setItem(draftKey(sessionId), value || ""); } catch(e){}
+}
+
+function loadDraft(sessionId){
+  try { return localStorage.getItem(draftKey(sessionId)) || ""; } catch(e){ return ""; }
+}
+
+function clearDraft(sessionId){
+  try { localStorage.removeItem(draftKey(sessionId)); } catch(e){}
+}
+
+// Capture drafts from existing textareas BEFORE we rebuild the table
+function captureDraftsFromDom(){
+  document.querySelectorAll("textarea.reply-box[data-session]").forEach((ta) => {
+    saveDraft(ta.dataset.session, ta.value || "");
+  });
+}
+
+// After we rebuild, restore drafts and attach listeners
+function wireDraftTextareas(){
+  document.querySelectorAll("textarea.reply-box[data-session]").forEach((ta) => {
+    const sid = ta.dataset.session;
+
+    // Restore only if empty (do not overwrite live typing)
+    if(!ta.value){
+      const d = loadDraft(sid);
+      if(d) ta.value = d;
+    }
+
+    // Save while typing
+    ta.addEventListener("input", () => saveDraft(sid, ta.value || ""));
+  });
+}
+
+/* -----------------------------
+   Data loading
+----------------------------- */
 async function loadBookings(){
   const data = await apiGet("/admin/api/bookings?status=pending");
   const tb = document.querySelector("#bookingsTbl tbody");
@@ -1111,8 +1159,8 @@ async function loadBookings(){
       <td><pre style="white-space:pre-wrap">${esc(details)}</pre></td>
       <td>${fmtTs(it.updated_at)}</td>
       <td class="row-actions">
-        <button onclick="approveBooking(${it.id})">Approve</button>
-        <button onclick="denyBooking(${it.id})">Deny</button>
+        <button type="button" onclick="approveBooking(${it.id})">Approve</button>
+        <button type="button" onclick="denyBooking(${it.id})">Deny</button>
       </td>
     `;
     tb.appendChild(tr);
@@ -1129,37 +1177,73 @@ async function denyBooking(id){
 }
 
 async function loadSupport(){
+  // IMPORTANT: save drafts before rebuilding table
+  captureDraftsFromDom();
+
   const data = await apiGet("/admin/api/support?status=open");
   const tb = document.querySelector("#supportTbl tbody");
   tb.innerHTML = "";
+
   (data.items || []).forEach(it => {
     const page = it.page_url || "";
+    const sid = it.session_id || "";
+    const sidEsc = esc(sid);
+
     const tr = document.createElement("tr");
     tr.innerHTML = `
-      <td>${esc(it.session_id)}</td>
+      <td>${sidEsc}</td>
       <td>${esc(it.user_message)}</td>
-      <td>${page ? `<a target="_blank" href="${esc(page)}">${esc(page)}</a>` : ""}</td>
+      <td>${page ? `<a target="_blank" rel="noopener noreferrer" href="${esc(page)}">${esc(page)}</a>` : ""}</td>
       <td>${fmtTs(it.updated_at)}</td>
-      <td><button onclick="openConversation('${esc(it.session_id)}')">View</button></td>
+      <td><button type="button" onclick="openConversation('${sidEsc}')">View</button></td>
       <td>
-        <textarea placeholder="Type your reply..." id="msg_${esc(it.session_id)}"></textarea>
-        <div>
-          <button onclick="sendReply('${esc(it.session_id)}', false)">Send</button>
-          <button onclick="sendReply('${esc(it.session_id)}', true)">Send & Close</button>
+        <textarea
+          class="reply-box"
+          data-session="${sidEsc}"
+          placeholder="Type your reply..."
+          id="msg_${sidEsc}"
+        ></textarea>
+        <div style="margin-top:6px;">
+          <button type="button" onclick="sendReply('${sidEsc}', false)">Send</button>
+          <button type="button" onclick="sendReply('${sidEsc}', true)">Send &amp; Close</button>
+          <span class="small" id="status_${sidEsc}"></span>
         </div>
       </td>
     `;
     tb.appendChild(tr);
   });
+
+  // Restore drafts + attach input listeners after table is rendered
+  wireDraftTextareas();
 }
 
 async function sendReply(sessionId, closeIt){
   const el = document.getElementById("msg_" + sessionId);
+  const statusEl = document.getElementById("status_" + sessionId);
+
   const text = (el && el.value || "").trim();
   if(!text){ alert("Write a message first"); return; }
-  await apiPost("/admin/api/support/message", {session_id: sessionId, text, close: closeIt});
-  if(el) el.value = "";
-  await loadSupport();
+
+  // UI lock for this row to avoid double send
+  const td = el ? el.closest("td") : null;
+  if(td) td.classList.add("sending");
+  if(statusEl) statusEl.textContent = "Sending...";
+
+  try{
+    await apiPost("/admin/api/support/message", {session_id: sessionId, text, close: closeIt});
+
+    // Clear draft ONLY after successful send
+    clearDraft(sessionId);
+
+    if(el) el.value = "";
+    if(statusEl) statusEl.textContent = closeIt ? "Sent & closed." : "Sent.";
+    await loadSupport();
+  }catch(err){
+    if(statusEl) statusEl.textContent = "Error sending.";
+    alert("Send failed: " + (err && err.message ? err.message : err));
+  }finally{
+    if(td) td.classList.remove("sending");
+  }
 }
 
 function closeModal(){
@@ -1191,7 +1275,17 @@ async function openConversation(sessionId){
 (async function init(){
   await loadBookings();
   await loadSupport();
-  setInterval(async ()=>{ await loadBookings(); await loadSupport(); }, 5000);
+
+  // periodic refresh WITHOUT losing drafts
+  setInterval(async ()=>{
+    try{
+      await loadBookings();
+      await loadSupport();
+    }catch(e){
+      // ignore transient errors
+      console.error(e);
+    }
+  }, 5000);
 })();
 </script>
 </body>
