@@ -58,7 +58,7 @@ MAX_CHUNKS = int(os.getenv("MAX_CHUNKS", "800"))
 CHUNK_CHARS = int(os.getenv("CHUNK_CHARS", "1200"))
 CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "200"))
 TOP_K = int(os.getenv("TOP_K", "6"))
-MIN_CONFIDENCE = float(os.getenv("MIN_CONFIDENCE", "0.20"))
+MIN_CONFIDENCE = float(os.getenv("MIN_CONFIDENCE", "0.15"))
 
 # CORS
 ALLOWED_ORIGINS = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "").split(",") if o.strip()]
@@ -853,6 +853,9 @@ async def chat(req: ChatRequest):
     q = req.question.strip()
     log_message(req.session_id, "user", q)
 
+    price_keywords = ["price", "cost", "how much", "سعر", "بكم", "تكلفة", "jod", "jd", "أسعار","Preis","Kosten", "wie viel"]
+    is_price_query = any(re.search(rf"\b{re.escape(k)}\b", q, re.IGNORECASE) for k in price_keywords)
+
     # If this session is in takeover mode, never answer with AI.
     if is_human_mode(req.session_id):
         upsert_support_request(req.session_id, q, req.page_url or "", reason="human")
@@ -906,8 +909,12 @@ async def chat(req: ChatRequest):
 
     # Payment questions -> force takeover + notify admin
     if looks_like_payment(q):
-        set_human_mode(req.session_id, True)
-        upsert_support_request(req.session_id, q, req.page_url or "", reason="payment")
+        if is_price_query and confidence > MIN_CONFIDENCE:
+            # سنترك الكود يكمل للأسفل ليصل لمرحلة توليد الإجابة بالذكاء الاصطناعي
+            pass 
+        else:
+         set_human_mode(req.session_id, True)
+         upsert_support_request(req.session_id, q, req.page_url or "", reason="payment")
 
         if can_send_booking_email():
             try:
@@ -1053,11 +1060,11 @@ async def chat(req: ChatRequest):
         "- Speak as a member of the Abood Freediver team (use 'we' when appropriate).\n"
         "- Do not claim you personally are Abood; you are the team's assistant.\n"
         "Behavior rules:\n"
-        "- ALWAYS prioritize SITE_CONTEXT for pricing, services, and locations. "
-        "If a price or numeric value exists in SITE_CONTEXT, provide it directly to the user.\n" 
-        "- If SITE_CONTEXT is insufficient, use WEB_CONTEXT to supplement information (like weather or general diving facts).\n"
+        "- If the user asks about PRICES or COSTS, you MUST extract them from SITE_CONTEXT if available.\n"
+        "- Providing a price from the website is NOT considered a 'booking confirmation'.\n"
+        "- Only transfer to human if the user asks HOW to pay (bank transfer, cash, etc.) or if SITE_CONTEXT is missing the price.\n" 
+        "- If SITE_CONTEXT is insufficient, use WEB_CONTEXT to supplement information.\n"
         "- Never confirm a booking; always state it is pending Abood’s manual approval.\n"
-        "- If a user asks for prices and you cannot find them in SITE_CONTEXT, explicitly state: 'I couldn't find the exact price on the site, but Abood will provide it once he reviews your request'.\n"
         "- Keep answers concise, practical, and safety-conscious."
     )
 
