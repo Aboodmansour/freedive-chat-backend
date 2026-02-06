@@ -58,7 +58,7 @@ MAX_CHUNKS = int(os.getenv("MAX_CHUNKS", "800"))
 CHUNK_CHARS = int(os.getenv("CHUNK_CHARS", "1200"))
 CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "200"))
 TOP_K = int(os.getenv("TOP_K", "6"))
-MIN_CONFIDENCE = float(os.getenv("MIN_CONFIDENCE", "0.15"))
+MIN_CONFIDENCE = float(os.getenv("MIN_CONFIDENCE", "0.20"))
 
 # CORS
 ALLOWED_ORIGINS = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "").split(",") if o.strip()]
@@ -320,6 +320,27 @@ _NEW_BOOKING_PATTERNS = [
 ]
 
 # =========================
+# Pricing triggers (MULTILINGUAL)  [EDIT]
+# =========================
+_PRICE_PATTERNS = [
+    # EN
+    r"\bprice\b", r"\bprices\b", r"\bcost\b", r"\bcosts\b",
+    r"\bfee\b", r"\bfees\b", r"\brate\b", r"\brates\b",
+    r"\bhow\s*much\b", r"\bpricing\b",
+    # DE
+    r"\bpreis\b", r"\bpreise\b", r"\bkosten\b", r"\bgebühr\b", r"\bgebühren\b",
+    r"\bwie\s*viel\b",
+    # AR
+    r"سعر", r"أسعار", r"كم\s*السعر", r"كم\s*تكلفة", r"تكلفة", r"رسوم",
+]
+
+
+def looks_like_pricing(q: str) -> bool:
+    text = (q or "")
+    return any(re.search(p, text, flags=re.IGNORECASE) for p in _PRICE_PATTERNS)
+
+
+# =========================
 # Payment triggers (MULTILINGUAL)
 # =========================
 _PAYMENT_PATTERNS = [
@@ -371,6 +392,9 @@ _PAYMENT_PATTERNS = [
 
 
 def looks_like_payment(q: str) -> bool:
+    # [EDIT] Pricing questions should NOT trigger payment takeover
+    if looks_like_pricing(q):
+        return False
     text = (q or "")
     return any(re.search(p, text, flags=re.IGNORECASE) for p in _PAYMENT_PATTERNS)
 
@@ -399,6 +423,31 @@ def is_medical_or_high_risk(q: str) -> bool:
 
 def can_send_booking_email() -> bool:
     return bool(OWNER_NOTIFY_EMAIL and SENDGRID_API_KEY)
+
+
+# =========================
+# Pricing pages (authoritative)  [EDIT]
+# =========================
+PRICE_URLS = [
+    "https://www.aboodfreediver.com/Prices.php",
+    "https://www.aboodfreediver.com/Freediver.html",
+    "https://www.aboodfreediver.com/Discoverfreediving.html",
+    "https://www.aboodfreediver.com/BasicFreediver.html",
+    "https://www.aboodfreediver.com/trainingsession.html",
+    "https://www.aboodfreediver.com/FunFreediving.html",
+    "https://www.aboodfreediver.com/Advancedfreediver.html",
+    "https://www.aboodfreediver.com/snorkelguide.html",
+    "https://www.aboodfreediver.com/freedivingequipment.html",
+    "https://www.aboodfreediver.com/photographysession.html",
+]
+
+
+def fetch_page_text(url: str) -> Tuple[str, str, str]:
+    """Return (url, title, cleaned_text)."""
+    r = requests.get(url, timeout=20, headers={"User-Agent": "AboodFreediverBot/1.0"})
+    r.raise_for_status()
+    title, text = strip_text(r.text)
+    return url, title, text
 
 
 # =========================
@@ -853,9 +902,6 @@ async def chat(req: ChatRequest):
     q = req.question.strip()
     log_message(req.session_id, "user", q)
 
-    price_keywords = ["price", "cost", "how much", "سعر", "بكم", "تكلفة", "jod", "jd", "أسعار","Preis","Kosten", "wie viel"]
-    is_price_query = any(re.search(rf"\b{re.escape(k)}\b", q, re.IGNORECASE) for k in price_keywords)
-
     # If this session is in takeover mode, never answer with AI.
     if is_human_mode(req.session_id):
         upsert_support_request(req.session_id, q, req.page_url or "", reason="human")
@@ -880,6 +926,7 @@ async def chat(req: ChatRequest):
         return ChatResponse(answer=answer, needs_human=True, booking_pending=False, booking_next_url=None, sources=[])
 
     # Human takeover / safety triggers
+    # [EDIT] Pricing questions should NOT trigger payment takeover.
     if is_medical_or_high_risk(q) or wants_human(q) or looks_like_payment(q):
         set_human_mode(req.session_id, True)
         upsert_support_request(req.session_id, q, req.page_url or "", reason="human")
@@ -902,45 +949,12 @@ async def chat(req: ChatRequest):
         answer = (
             "Thanks — this is the Abood Freediver team. "
             "For safety and accuracy, Abood will reply directly here. "
-            "Please share your name and preferred contact (WhatsApp or email)."
         )
         log_message(req.session_id, "assistant", answer)
         return ChatResponse(answer=answer, needs_human=True, booking_pending=False, booking_next_url=None, sources=[])
 
-    # Payment questions -> force takeover + notify admin
-    if looks_like_payment(q):
-        if is_price_query and confidence > MIN_CONFIDENCE:
-            # سنترك الكود يكمل للأسفل ليصل لمرحلة توليد الإجابة بالذكاء الاصطناعي
-            pass 
-        else:
-         set_human_mode(req.session_id, True)
-         upsert_support_request(req.session_id, q, req.page_url or "", reason="payment")
-
-        if can_send_booking_email():
-            try:
-                send_email(
-                    OWNER_NOTIFY_EMAIL,
-                    "Abood Freediver: Payment question (needs human reply)",
-                    f"""
-                    <h3>Payment question (human reply needed)</h3>
-                    <p><b>Session:</b> {req.session_id}</p>
-                    <p><b>Page:</b> {req.page_url or ''}</p>
-                    <p><b>User message:</b> {q}</p>
-                    <p>Open the admin dashboard to reply.</p>
-                    """,
-                )
-            except Exception as e:
-                print("Email payment notify failed:", str(e))
-
-        answer = (
-            "Thanks — for payment details, a team member will reply to you directly here.\n\n"
-            "Please share:\n"
-            "1) Which course/session you want\n"
-            "2) When you plan to come\n"
-            "3) Your preferred payment method (cash / card / transfer)\n"
-        )
-        log_message(req.session_id, "assistant", answer)
-        return ChatResponse(answer=answer, needs_human=True, booking_pending=False, booking_next_url=None, sources=[])
+    # NOTE: The duplicate "Payment questions -> force takeover + notify admin" block was removed
+    # because payment takeover is already handled above, and pricing questions are excluded.
 
     latest_booking = get_latest_booking_for_session(req.session_id)
 
@@ -955,8 +969,6 @@ async def chat(req: ChatRequest):
         if status == "pending":
             answer = (
                 "Your booking request is still pending Abood’s approval.\n\n"
-                "If you want to update anything (date/time, number of people, contact), "
-                "tell us here and we will forward it."
             )
             log_message(req.session_id, "assistant", answer)
             return ChatResponse(answer=answer, needs_human=True, booking_pending=True, booking_next_url=None, sources=[])
@@ -987,10 +999,6 @@ async def chat(req: ChatRequest):
 
             answer = (
                 "I can take your new booking request, but I can’t confirm it until Abood approves.\n\n"
-                "Please share:\n"
-                "1) Desired date(s) + time window\n"
-                "2) Number of people\n"
-                "3) Your contact (WhatsApp or email)\n\n"
                 "I’ve sent your request to Abood for approval."
             )
             log_message(req.session_id, "assistant", answer)
@@ -1042,10 +1050,6 @@ async def chat(req: ChatRequest):
 
         answer = (
             "This is the Abood Freediver team. I can take your booking request, but I can’t confirm it until Abood approves.\n\n"
-            "Please share:\n"
-            "1) Desired date(s) + time window\n"
-            "2) Number of people\n"
-            "3) Your contact (WhatsApp or email)\n\n"
             "I’ve sent your request to Abood for approval."
         )
         log_message(req.session_id, "assistant", answer)
@@ -1060,12 +1064,10 @@ async def chat(req: ChatRequest):
         "- Speak as a member of the Abood Freediver team (use 'we' when appropriate).\n"
         "- Do not claim you personally are Abood; you are the team's assistant.\n"
         "Behavior rules:\n"
-        "- If the user asks about PRICES or COSTS, you MUST extract them from SITE_CONTEXT if available.\n"
-        "- Providing a price from the website is NOT considered a 'booking confirmation'.\n"
-        "- Only transfer to human if the user asks HOW to pay (bank transfer, cash, etc.) or if SITE_CONTEXT is missing the price.\n" 
-        "- If SITE_CONTEXT is insufficient, use WEB_CONTEXT to supplement information.\n"
-        "- Never confirm a booking; always state it is pending Abood’s manual approval.\n"
-        "- Keep answers concise, practical, and safety-conscious."
+        "- Prefer answering using SITE_CONTEXT.\n"
+        "- If SITE_CONTEXT is insufficient, you may use WEB_CONTEXT if provided.\n"
+        "- Never confirm a booking; only say it’s pending Abood’s approval.\n"
+        "- Keep answers concise, practical, and safety-conscious.\n"
     )
 
     sources = []
@@ -1073,6 +1075,22 @@ async def chat(req: ChatRequest):
     for c in chunks:
         sources.append({"title": c["title"] or "Website page", "url": c["url"]})
         site_context += f"\n\nSOURCE: {c['url']}\n{c['text'][:2000]}"
+
+    # [EDIT] If it's a pricing question, attach authoritative pricing sources
+    if looks_like_pricing(q):
+        extra = []
+        for u in PRICE_URLS:
+            try:
+                url, title, text = fetch_page_text(u)
+                if text:
+                    extra.append((url, title, text[:2500]))
+            except Exception as e:
+                print("Pricing fetch failed:", u, str(e))
+
+        if extra:
+            for (url, title, txt) in extra:
+                sources.append({"title": title or "Pricing page", "url": url})
+                site_context += f"\n\nSOURCE: {url}\n{txt}"
 
     web_results = serpapi_search(q) if conf < MIN_CONFIDENCE else []
     web_context = ""
@@ -1095,6 +1113,10 @@ async def chat(req: ChatRequest):
     for r in web_results[:3]:
         if r.get("link"):
             out_sources.append({"title": r.get("title", "Web source"), "url": r["link"]})
+
+    # [EDIT] For pricing questions, always return pricing sources (even if embedding confidence is low)
+    if looks_like_pricing(q):
+        out_sources = sources[:4]
 
     return ChatResponse(answer=answer, needs_human=False, booking_pending=False, booking_next_url=None, sources=out_sources)
 
