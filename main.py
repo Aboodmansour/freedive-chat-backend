@@ -932,6 +932,7 @@ async def chat(req: ChatRequest):
                     <p><b>Session:</b> {req.session_id}</p>
                     <p><b>Page:</b> {req.page_url or ''}</p>
                     <p><b>User message:</b> {q}</p>
+                    <p><b>Dashboard:</b> <a href="https://freedive-chat-backend.onrender.com/admin/dashboard">Open Admin Dashboard</a></p>
                     """,
                 )
             except Exception as e:
@@ -963,6 +964,7 @@ async def chat(req: ChatRequest):
                     <p><b>Session:</b> {req.session_id}</p>
                     <p><b>Page:</b> {req.page_url or ''}</p>
                     <p><b>User message:</b> {q}</p>
+                    <p><b>Dashboard:</b> <a href="https://freedive-chat-backend.onrender.com/admin/dashboard">Open Admin Dashboard</a></p>
                     """,
                 )
             except Exception as e:
