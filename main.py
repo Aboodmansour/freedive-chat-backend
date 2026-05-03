@@ -939,7 +939,13 @@ async def chat(req: ChatRequest):
 
         answer = "Thanks — this is the Abood Freediver team. Abood will reply here shortly."
         log_message(req.session_id, "assistant", answer)
-        return ChatResponse(answer=answer, needs_human=True, booking_pending=False, booking_next_url=None, sources=[])
+        return ChatResponse(
+        answer="",
+        needs_human=True,
+        booking_pending=False,
+        booking_next_url=None,
+        sources=[]
+    )
 
     # Human takeover / safety triggers
     # [EDIT] Pricing questions should NOT trigger payment takeover.
