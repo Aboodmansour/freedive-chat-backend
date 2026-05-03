@@ -8,6 +8,8 @@ import re
 import sqlite3
 import secrets
 import asyncio
+import smtplib
+from email.message import EmailMessage
 from typing import List, Dict, Any, Optional, Tuple
 
 import requests
@@ -32,8 +34,13 @@ if env_path.exists():
 # Config
 # =========================
 OWNER_NOTIFY_EMAIL = os.getenv("OWNER_NOTIFY_EMAIL", "").strip()
-SENDGRID_API_KEY = os.getenv("SENDGRID_API_KEY", "").strip()
-SMTP_FROM = os.getenv("SMTP_FROM", "").strip()  # optional; if empty we'll use OWNER_NOTIFY_EMAIL
+
+SMTP_HOST = os.getenv("SMTP_HOST", "").strip()
+SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
+SMTP_USER = os.getenv("SMTP_USER", "").strip()
+SMTP_PASS = os.getenv("SMTP_PASS", "").strip()
+SMTP_FROM = os.getenv("SMTP_FROM", "").strip() or SMTP_USER or OWNER_NOTIFY_EMAIL
+SMTP_USE_TLS = os.getenv("SMTP_USE_TLS", "true").lower() == "true"
 
 SERPAPI_KEY = os.getenv("SEARCHAPI_KEY", "").strip()
 
@@ -422,7 +429,7 @@ def is_medical_or_high_risk(q: str) -> bool:
 
 
 def can_send_booking_email() -> bool:
-    return bool(OWNER_NOTIFY_EMAIL and SENDGRID_API_KEY)
+    return bool(OWNER_NOTIFY_EMAIL and SMTP_HOST and SMTP_PORT and SMTP_USER and SMTP_PASS)
 
 
 # =========================
@@ -592,24 +599,33 @@ async def generate_answer(system: str, user: str) -> str:
 
 
 # =========================
-# SendGrid email
+# SMTP email
 # =========================
 def send_email(to_email: str, subject: str, html: str):
-    if not SENDGRID_API_KEY:
-        raise RuntimeError("SENDGRID_API_KEY not set")
     if not to_email:
         raise RuntimeError("OWNER_NOTIFY_EMAIL not set")
-    from_email = SMTP_FROM or to_email
-    payload = {
-        "personalizations": [{"to": [{"email": to_email}]}],
-        "from": {"email": from_email},
-        "subject": subject,
-        "content": [{"type": "text/html", "value": html}],
-    }
-    headers = {"Authorization": f"Bearer {SENDGRID_API_KEY}", "Content-Type": "application/json"}
-    r = requests.post("https://api.sendgrid.com/v3/mail/send", headers=headers, data=json.dumps(payload), timeout=20)
-    if r.status_code >= 300:
-        raise RuntimeError(f"SendGrid error {r.status_code}: {r.text}")
+    if not SMTP_HOST:
+        raise RuntimeError("SMTP_HOST not set")
+    if not SMTP_USER:
+        raise RuntimeError("SMTP_USER not set")
+    if not SMTP_PASS:
+        raise RuntimeError("SMTP_PASS not set")
+
+    msg = EmailMessage()
+    msg["From"] = SMTP_FROM
+    msg["To"] = to_email
+    msg["Subject"] = subject
+    msg.set_content("This email requires an HTML-capable email client.")
+    msg.add_alternative(html, subtype="html")
+
+    try:
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=20) as smtp:
+            if SMTP_USE_TLS:
+                smtp.starttls()
+            smtp.login(SMTP_USER, SMTP_PASS)
+            smtp.send_message(msg)
+    except Exception as e:
+        raise RuntimeError(f"SMTP email error: {str(e)}")
 
 
 # =========================
